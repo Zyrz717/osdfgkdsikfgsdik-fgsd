@@ -53,8 +53,8 @@ import java.util.UUID;
 public class RandomTeleport extends LoadedPlugin {
 
     private static final long COOLDOWN_MS = 5L * 60L * 1000L; // 5 minutes
-    private static final int BASIC_MIN = 5000, BASIC_MAX = 12500;
-    private static final int VIP_MIN   = 15000, VIP_MAX   = 25000;
+    private static final int BASIC_MIN = 2500, BASIC_MAX = 6250;
+    private static final int VIP_MIN   = 7500, VIP_MAX   = 12500;
 
     private static final int WARMUP_SECONDS = 5;
 
