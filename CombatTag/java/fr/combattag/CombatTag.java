@@ -5,13 +5,18 @@ import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.entity.EnderPearl;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Projectile;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
+import org.bukkit.event.block.Action;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.entity.ProjectileLaunchEvent;
 import org.bukkit.event.player.PlayerCommandPreprocessEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
@@ -34,6 +39,9 @@ import java.util.UUID;
  *   - Chaque coup relance le compte a rebours a 15 s.
  *   - MORT = fin de combat : le mort ET ses adversaires sortent du combat
  *     (sauf si un adversaire est encore engage contre quelqu'un d'autre).
+ *   - Perle d'ender AUTORISEE en combat, mais :
+ *       * cooldown de 15 s entre deux perles (uniquement en combat) ;
+ *       * impossible d'atterrir dans la ZONE PROTEGEE.
  *   - Pendant le combat, seules /shop et /tag sont autorisees.
  *   - Pendant le combat, la ZONE PROTEGEE est inaccessible : blocage a l'entree,
  *     Lenteur I pendant 10 s + message. C'est INDIVIDUEL : un joueur hors combat
@@ -46,6 +54,8 @@ public class CombatTag extends LoadedPlugin implements Listener {
     private static final long TAG_MS = 15_000L; // 15 secondes
     private static final List<String> ALLOWED = List.of("shop", "tag"); // commandes autorisees en combat
 
+    private static final long PEARL_COOLDOWN_MS = 15_000L; // cooldown perle en combat
+
     // ---------- Zone interdite en combat ----------
     // Coins : (-686, 163, -207)  <->  (-781, 70, -302)
     private static final String REGION_WORLD = null; // null = tous les mondes, sinon ex: "world"
@@ -55,11 +65,12 @@ public class CombatTag extends LoadedPlugin implements Listener {
 
     private static final int SLOW_TICKS = 200;   // 10 secondes
     private static final int SLOW_LEVEL = 0;     // amplifier 0 = Lenteur I
-    private static final long DENY_COOLDOWN_MS = 2_000L; // anti-spam message/effet
+    private static final long DENY_COOLDOWN_MS = 2_000L;  // anti-spam message zone
 
     private final Map<UUID, Long> tagged = new HashMap<>();            // uuid -> instant de fin (ms)
     private final Map<UUID, Set<UUID>> opponents = new HashMap<>();    // uuid -> adversaires en cours
     private final Map<UUID, Long> denyCooldown = new HashMap<>();      // anti-spam zone
+    private final Map<UUID, Long> pearlCooldown = new HashMap<>();     // uuid -> prochaine perle autorisee
     private final Set<UUID> combatLogged = new HashSet<>();            // quit en combat (filet anti-dupe)
 
     @Override
@@ -129,9 +140,16 @@ public class CombatTag extends LoadedPlugin implements Listener {
         return ms <= 0 ? 0 : (ms + 999) / 1000; // arrondi au superieur
     }
 
-    /** Retire completement le tag d'un joueur et nettoie les liens d'adversaires. */
+    /** Retire completement le tag d'un joueur, nettoie les liens et le cooldown perle. */
     private void removeTag(UUID uuid) {
         tagged.remove(uuid);
+        pearlCooldown.remove(uuid); // hors combat -> plus de restriction perle
+
+        Player player = Bukkit.getPlayer(uuid);
+        if (player != null && player.isOnline()) {
+            player.setCooldown(Material.ENDER_PEARL, 0); // enleve l'overlay de cooldown
+        }
+
         Set<UUID> mine = opponents.remove(uuid);
         if (mine != null) {
             for (UUID other : mine) {
@@ -144,37 +162,56 @@ public class CombatTag extends LoadedPlugin implements Listener {
         }
     }
 
-    // ---------- Mort = fin de combat ----------
+    // ---------- Perle : cooldown 15 s en combat ----------
 
-    @EventHandler
-    public void onDeath(PlayerDeathEvent event) {
-        handleDeath(event.getEntity().getUniqueId());
+    /**
+     * Blocage au clic droit : annule AVANT la consommation, la perle n'est pas perdue.
+     */
+    @EventHandler(ignoreCancelled = true)
+    public void onInteract(PlayerInteractEvent event) {
+        Action action = event.getAction();
+        if (action != Action.RIGHT_CLICK_AIR && action != Action.RIGHT_CLICK_BLOCK) return;
+
+        Player player = event.getPlayer();
+        if (remainingSeconds(player.getUniqueId()) <= 0) return; // hors combat -> pas de cooldown
+
+        var item = event.getItem();
+        if (item == null || item.getType() != Material.ENDER_PEARL) return;
+
+        long left = pearlCooldownLeft(player.getUniqueId());
+        if (left > 0) {
+            event.setCancelled(true);
+            player.updateInventory(); // evite l'item fantome cote client
+            player.sendMessage(msg("Perle en cooldown : encore " + left + "s.", NamedTextColor.RED));
+        }
     }
 
     /**
-     * Le joueur est mort : il sort du combat, et chacun de ses adversaires
-     * en sort aussi s'il n'a plus personne d'autre en face.
+     * La perle part reellement : on demarre le cooldown ici (et pas au clic),
+     * sinon le lancement declenche immediatement son propre cooldown.
      */
-    private void handleDeath(UUID deadId) {
-        Set<UUID> foes = opponents.get(deadId);
-        List<UUID> copy = foes == null ? List.of() : new ArrayList<>(foes);
+    @EventHandler(ignoreCancelled = true)
+    public void onProjectileLaunch(ProjectileLaunchEvent event) {
+        if (!(event.getEntity() instanceof EnderPearl pearl)) return;
+        if (!(pearl.getShooter() instanceof Player player)) return;
+        if (remainingSeconds(player.getUniqueId()) <= 0) return;
 
-        removeTag(deadId); // nettoie aussi les liens dans les deux sens
-
-        for (UUID foeId : copy) {
-            // encore engage contre quelqu'un d'autre ? on le laisse en combat
-            Set<UUID> still = opponents.get(foeId);
-            if (still != null && !still.isEmpty()) continue;
-
-            if (tagged.remove(foeId) != null) {
-                Player foe = Bukkit.getPlayer(foeId);
-                if (foe != null && foe.isOnline()) {
-                    foe.sendMessage(msg("Ton adversaire est mort : tu n'es plus en combat.", NamedTextColor.GREEN));
-                    foe.sendActionBar(Component.empty());
-                }
-            }
-            opponents.remove(foeId);
+        long left = pearlCooldownLeft(player.getUniqueId());
+        if (left > 0) { // filet de securite si le clic n'a pas ete capte
+            event.setCancelled(true);
+            player.updateInventory();
+            return;
         }
+
+        pearlCooldown.put(player.getUniqueId(), System.currentTimeMillis() + PEARL_COOLDOWN_MS);
+        player.setCooldown(Material.ENDER_PEARL, (int) (PEARL_COOLDOWN_MS / 50)); // overlay vanilla
+    }
+
+    private long pearlCooldownLeft(UUID uuid) {
+        Long until = pearlCooldown.get(uuid);
+        if (until == null) return 0;
+        long ms = until - System.currentTimeMillis();
+        return ms <= 0 ? 0 : (ms + 999) / 1000;
     }
 
     // ---------- Zone interdite pendant le combat ----------
@@ -196,9 +233,14 @@ public class CombatTag extends LoadedPlugin implements Listener {
         if (inRegion(from)) return; // deja dedans (tag pris a l'interieur) -> on le laisse sortir
 
         event.setCancelled(true);
-        denyEntry(player);
+        denyEntry(player, false);
     }
 
+    /**
+     * Bloque TOUT tp vers la zone en combat : perle d'ender, fruit chorus,
+     * commandes de tp, etc. La perle est deja consommee a ce stade : le joueur
+     * reste sur place et garde son cooldown.
+     */
     @EventHandler(ignoreCancelled = true)
     public void onTeleport(PlayerTeleportEvent event) {
         Player player = event.getPlayer();
@@ -208,11 +250,12 @@ public class CombatTag extends LoadedPlugin implements Listener {
         if (to == null || !inRegion(to)) return;
         if (inRegion(event.getFrom())) return;
 
-        event.setCancelled(true); // bloque aussi perle d'ender / tp
-        denyEntry(player);
+        boolean pearl = event.getCause() == PlayerTeleportEvent.TeleportCause.ENDER_PEARL;
+        event.setCancelled(true);
+        denyEntry(player, pearl);
     }
 
-    private void denyEntry(Player player) {
+    private void denyEntry(Player player, boolean byPearl) {
         long now = System.currentTimeMillis();
         Long until = denyCooldown.get(player.getUniqueId());
         if (until != null && now < until) return; // anti-spam
@@ -220,7 +263,9 @@ public class CombatTag extends LoadedPlugin implements Listener {
         denyCooldown.put(player.getUniqueId(), now + DENY_COOLDOWN_MS);
         // PotionEffectType.SLOWNESS -> sur < 1.20.5 c'est PotionEffectType.SLOW
         player.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, SLOW_TICKS, SLOW_LEVEL, false, true, true));
-        player.sendMessage(msg("Zone interdite en combat ! Lenteur I pendant "
+
+        String prefix = byPearl ? "Perle bloquee : " : "";
+        player.sendMessage(msg(prefix + "zone interdite en combat ! Lenteur I pendant "
                 + (SLOW_TICKS / 20) + "s. Reviens quand ton combat est termine.", NamedTextColor.RED));
     }
 
@@ -250,6 +295,40 @@ public class CombatTag extends LoadedPlugin implements Listener {
         if (!ALLOWED.contains(base)) {
             event.setCancelled(true);
             player.sendMessage(msg("Interdit en combat ! Seules /shop et /tag sont autorisees.", NamedTextColor.RED));
+        }
+    }
+
+    // ---------- Mort = fin de combat ----------
+
+    @EventHandler
+    public void onDeath(PlayerDeathEvent event) {
+        handleDeath(event.getEntity().getUniqueId());
+    }
+
+    /**
+     * Le joueur est mort : il sort du combat, et chacun de ses adversaires
+     * en sort aussi s'il n'a plus personne d'autre en face.
+     */
+    private void handleDeath(UUID deadId) {
+        Set<UUID> foes = opponents.get(deadId);
+        List<UUID> copy = foes == null ? List.of() : new ArrayList<>(foes);
+
+        removeTag(deadId); // nettoie aussi les liens dans les deux sens
+
+        for (UUID foeId : copy) {
+            // encore engage contre quelqu'un d'autre ? on le laisse en combat
+            Set<UUID> still = opponents.get(foeId);
+            if (still != null && !still.isEmpty()) continue;
+
+            boolean wasTagged = tagged.containsKey(foeId);
+            removeTag(foeId);
+            if (wasTagged) {
+                Player foe = Bukkit.getPlayer(foeId);
+                if (foe != null && foe.isOnline()) {
+                    foe.sendMessage(msg("Ton adversaire est mort : tu n'es plus en combat.", NamedTextColor.GREEN));
+                    foe.sendActionBar(Component.empty());
+                }
+            }
         }
     }
 
