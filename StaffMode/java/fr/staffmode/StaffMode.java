@@ -19,8 +19,13 @@ import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
+import org.bukkit.event.player.PlayerGameModeChangeEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerRespawnEvent;
+import org.bukkit.event.player.PlayerTeleportEvent;
+import org.bukkit.event.player.PlayerToggleFlightEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.util.io.BukkitObjectInputStream;
 import org.bukkit.util.io.BukkitObjectOutputStream;
@@ -68,13 +73,28 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  *   Si tu possedes deja le grade en permanent (rare), il n'est PAS retire a la sortie.
  *
- *   >>> CORRECTIF IMPORTANT <<<
+ *   >>> CORRECTIF LUCKPERMS <<<
  *   L'ancienne version lisait l'API LuckPerms via le classloader du plugin. Avec un
  *   loader custom (fr.loader.api.LoadedPlugin), ce classloader ne voit PAS les classes
  *   de LuckPerms -> la lecture des grades echouait silencieusement -> le grade n'etait
  *   ni change a l'entree, ni restaure a la sortie. On charge maintenant l'API via le
  *   classloader de LuckPerms lui-meme (voir lpClassLoader / lpApiOrNull), ce qui repare
  *   completement la gestion des grades.
+ *
+ *   >>> CORRECTIF FLY <<<
+ *   Le fly etait pose UNE SEULE FOIS dans enterStaff(). Or setAllowFlight(false) est
+ *   ré-applique par le serveur ou par un autre plugin apres notre appel : changement de
+ *   gamemode (dont /survie), respawn, teleportation, changement de monde, anticheat,
+ *   Essentials, drapeau WorldGuard "fly deny"... Resultat : le fly saute juste apres
+ *   l'activation du mode staff. Le fly est desormais APPLIQUE EN CONTINU :
+ *     - applyStaffFlight()      : pose allowFlight + flying,
+ *     - applyStaffFlightLater() : le repose au tick suivant ET 5 ticks plus tard,
+ *       parce que les autres plugins ecrasent la valeur APRES nous dans le meme tick,
+ *     - une tache periodique (2 s) le remet pour tout joueur en mode staff,
+ *     - PlayerToggleFlightEvent est de-annule si un anticheat le bloque,
+ *     - gamemode / respawn / teleport / changement de monde le re-appliquent.
+ *   La sortie de staff ne coupe plus le fly d'un joueur en CREATIVE ou SPECTATOR
+ *   (avant, /staff en creatif te faisait tomber).
  *
  * BACKUP UNIVERSEL : toutes les X secondes, l'inventaire COMPLET de chaque joueur en
  * ligne (inventaire + armure + main gauche + ender chest) est serialise en base64 et
@@ -120,6 +140,9 @@ public class StaffMode extends LoadedPlugin implements Listener {
     private final Map<UUID, String> lastSig = new ConcurrentHashMap<>();
     private final Object diskLock = new Object();
 
+    // Tache d'application continue du fly (correctif fly).
+    private int flyTaskId = -1;
+
     private final Set<String> myCommands = new HashSet<>();
     private File file;
     private File backupFile;   // backup staff (redondance) : inv-backups.yml
@@ -149,6 +172,9 @@ public class StaffMode extends LoadedPlugin implements Listener {
         startBackupTask();
         snapshotAll("startup", true, true);
 
+        // Tache d'application continue du fly.
+        startFlyTask();
+
         getLogger().info("[StaffMode] active." + (roleEnabled && !luckPermsPresent
                 ? " (role active mais LuckPerms introuvable -> gestion de role ignoree)" : ""));
     }
@@ -159,6 +185,10 @@ public class StaffMode extends LoadedPlugin implements Listener {
             if (backupTaskId != -1) {
                 try { Bukkit.getScheduler().cancelTask(backupTaskId); } catch (Throwable ignored) {}
                 backupTaskId = -1;
+            }
+            if (flyTaskId != -1) {
+                try { Bukkit.getScheduler().cancelTask(flyTaskId); } catch (Throwable ignored) {}
+                flyTaskId = -1;
             }
             // Backup final (synchrone pour garantir l'ecriture avant l'arret).
             snapshotAll("shutdown", true, false);
@@ -228,6 +258,12 @@ public class StaffMode extends LoadedPlugin implements Listener {
             "  - super_modo\n" +
             "  - mod\n" +
             "\n" +
+            "fly:\n" +
+            "  # Intervalle (en secondes) de re-application du fly en mode staff.\n" +
+            "  # Sert de filet quand un autre plugin (anticheat, WorldGuard, Essentials)\n" +
+            "  # coupe le fly. Mettre 0 desactive la tache periodique.\n" +
+            "  recheck-seconds: 2\n" +
+            "\n" +
             "backup:\n" +
             "  # Sauvegarde automatique de TOUS les inventaires sur le disque.\n" +
             "  enabled: true\n" +
@@ -236,10 +272,13 @@ public class StaffMode extends LoadedPlugin implements Listener {
             "  # Nombre maximum de sauvegardes conservees par joueur.\n" +
             "  max-per-player: 30\n";
 
+    private int flyRecheckSeconds = 2;
+
     private void loadConfig() {
         roleEnabled = true;
         gradeList = new ArrayList<>();
         backupEnabled = true; backupIntervalSeconds = 300; backupMaxPerPlayer = 30;
+        flyRecheckSeconds = 2;
         try {
             File dir = configFile.getParentFile();
             if (dir != null && !dir.exists()) dir.mkdirs();
@@ -254,12 +293,14 @@ public class StaffMode extends LoadedPlugin implements Listener {
                 cfg.set("grades", new ArrayList<>(List.of("owner", "super_admin", "admin", "super_modo", "mod")));
                 changed = true;
             }
+            if (!cfg.contains("fly.recheck-seconds"))    { cfg.set("fly.recheck-seconds", 2); changed = true; }
             if (!cfg.contains("backup.enabled"))         { cfg.set("backup.enabled", true); changed = true; }
             if (!cfg.contains("backup.interval-seconds")) { cfg.set("backup.interval-seconds", 300); changed = true; }
             if (!cfg.contains("backup.max-per-player"))  { cfg.set("backup.max-per-player", 30); changed = true; }
 
             roleEnabled = cfg.getBoolean("role.enabled", true);
             gradeList = new ArrayList<>(cfg.getStringList("grades"));
+            flyRecheckSeconds = Math.max(0, cfg.getInt("fly.recheck-seconds", 2));
             backupEnabled = cfg.getBoolean("backup.enabled", true);
             backupIntervalSeconds = Math.max(10, cfg.getInt("backup.interval-seconds", 300));
             backupMaxPerPlayer = Math.max(3, cfg.getInt("backup.max-per-player", 30));
@@ -267,6 +308,97 @@ public class StaffMode extends LoadedPlugin implements Listener {
             if (changed) cfg.save(configFile);
         } catch (Throwable t) {
             getLogger().warning("[StaffMode] config KO : " + t.getMessage());
+        }
+    }
+
+    // ===================== FLY (correctif) =====================
+
+    /** Le plugin hote, ou null si le loader n'expose pas un Plugin Bukkit. */
+    private org.bukkit.plugin.Plugin hostPlugin() {
+        try {
+            Object h = getHost();
+            if (h instanceof org.bukkit.plugin.Plugin pl) return pl;
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /**
+     * Pose god+fly pour un joueur en mode staff.
+     * Volontairement idempotente : on peut l'appeler aussi souvent qu'on veut.
+     */
+    private void applyStaffFlight(Player p) {
+        if (p == null || !p.isOnline()) return;
+        if (!staffMode.contains(p.getUniqueId())) return;
+        try {
+            if (!p.getAllowFlight()) p.setAllowFlight(true);
+            if (!p.isFlying()) {
+                try { p.setFlying(true); }
+                catch (IllegalStateException ex) {
+                    // Peut arriver si allowFlight n'a pas encore ete propage : on retente au tick suivant.
+                    org.bukkit.plugin.Plugin plugin = hostPlugin();
+                    if (plugin != null) {
+                        Bukkit.getScheduler().runTask(plugin, () -> {
+                            if (staffMode.contains(p.getUniqueId()) && p.isOnline()) {
+                                p.setAllowFlight(true);
+                                try { p.setFlying(true); } catch (Throwable ignored) {}
+                            }
+                        });
+                    }
+                }
+            }
+            p.setFireTicks(0);
+        } catch (Throwable t) {
+            getLogger().warning("[StaffMode] fly impossible pour " + p.getName() + " : " + t);
+        }
+    }
+
+    /**
+     * Pose le fly MAINTENANT, puis au tick suivant, puis 5 ticks plus tard.
+     * C'est le coeur du correctif : le changement de gamemode, le respawn, la
+     * teleportation et la plupart des plugins remettent allowFlight a false APRES
+     * notre appel dans le meme tick. Une seule pose ne survit donc pas.
+     */
+    private void applyStaffFlightLater(Player p) {
+        applyStaffFlight(p);
+        org.bukkit.plugin.Plugin plugin = hostPlugin();
+        if (plugin == null) return;
+        try {
+            Bukkit.getScheduler().runTask(plugin, () -> applyStaffFlight(p));
+            Bukkit.getScheduler().runTaskLater(plugin, () -> applyStaffFlight(p), 5L);
+        } catch (Throwable ignored) {}
+    }
+
+    /** Filet periodique : remet le fly a tout joueur en mode staff qui l'aurait perdu. */
+    private void startFlyTask() {
+        if (flyRecheckSeconds <= 0) return;
+        org.bukkit.plugin.Plugin plugin = hostPlugin();
+        if (plugin == null) {
+            getLogger().warning("[StaffMode] getHost() n'est pas un Plugin -> "
+                    + "re-application periodique du fly desactivee.");
+            return;
+        }
+        long ticks = Math.max(20L, flyRecheckSeconds * 20L);
+        try {
+            flyTaskId = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
+                if (staffMode.isEmpty()) return;
+                for (Player p : Bukkit.getOnlinePlayers()) {
+                    if (staffMode.contains(p.getUniqueId())) applyStaffFlight(p);
+                }
+            }, ticks, ticks).getTaskId();
+        } catch (Throwable t) {
+            getLogger().warning("[StaffMode] tache fly impossible a lancer : " + t);
+        }
+    }
+
+    /** Coupe le fly en sortie de staff, SAUF en creatif/spectateur ou il est legitime. */
+    private void clearStaffFlight(Player p) {
+        try {
+            GameMode gm = p.getGameMode();
+            if (gm == GameMode.CREATIVE || gm == GameMode.SPECTATOR) return;
+            p.setFlying(false);
+            p.setAllowFlight(false);
+        } catch (Throwable t) {
+            getLogger().warning("[StaffMode] retrait du fly KO pour " + p.getName() + " : " + t);
         }
     }
 
@@ -506,7 +638,13 @@ public class StaffMode extends LoadedPlugin implements Listener {
         if (!(s instanceof Player p)) { send(s, "Joueurs uniquement.", NamedTextColor.RED); return true; }
         if (!isStaff(p)) { send(p, "Tu n'as pas la permission " + PERM + ".", NamedTextColor.RED); return true; }
         p.setGameMode(GameMode.SURVIVAL);
-        send(p, "Tu es maintenant en SURVIE.", NamedTextColor.GREEN);
+        // Le changement de gamemode remet allowFlight a false : si on est en staff, on repose le fly.
+        if (staffMode.contains(p.getUniqueId())) {
+            applyStaffFlightLater(p);
+            send(p, "Tu es maintenant en SURVIE. (fly conserve, tu es en mode staff)", NamedTextColor.GREEN);
+        } else {
+            send(p, "Tu es maintenant en SURVIE.", NamedTextColor.GREEN);
+        }
         return true;
     }
 
@@ -613,6 +751,8 @@ public class StaffMode extends LoadedPlugin implements Listener {
             if (target == null) { send(p, "Joueur introuvable : " + a[0], NamedTextColor.RED); return true; }
             if (target.equals(p)) { send(p, "Tu ne peux pas te teleporter a toi-meme.", NamedTextColor.RED); return true; }
             p.teleport(target.getLocation());
+            // Une teleportation coupe frequemment le fly : on le repose.
+            applyStaffFlightLater(p);
             send(p, "Teleporte a " + target.getName() + ".", NamedTextColor.GREEN);
             return true;
         }
@@ -731,12 +871,14 @@ public class StaffMode extends LoadedPlugin implements Listener {
         p.getInventory().setArmorContents(new ItemStack[4]);
         p.getInventory().setItemInOffHand(null);
 
+        // IMPORTANT : le joueur doit etre marque staff AVANT d'appliquer le fly,
+        // car applyStaffFlight() refuse d'agir sur un joueur hors mode staff.
         staffMode.add(u);
 
-        // GOD + FLY en interne.
-        p.setAllowFlight(true);
-        p.setFlying(true);
-        p.setFireTicks(0);
+        // GOD + FLY. Pose immediate + re-pose au tick suivant et 5 ticks plus tard :
+        // c'est ce qui empeche un autre plugin (ou le changement d'etat du joueur)
+        // d'ecraser allowFlight juste apres nous.
+        applyStaffFlightLater(p);
 
         p.updateInventory();
         send(p, "Mode staff ACTIVE. (god + fly)", NamedTextColor.GREEN);
@@ -746,8 +888,7 @@ public class StaffMode extends LoadedPlugin implements Listener {
         UUID u = p.getUniqueId();
         staffMode.remove(u);
 
-        p.setFlying(false);
-        p.setAllowFlight(false);
+        clearStaffFlight(p);
 
         if (restore) restoreInventory(p);
 
@@ -827,6 +968,45 @@ public class StaffMode extends LoadedPlugin implements Listener {
         }
     }
 
+    // ===================== FLY : evenements qui le cassent =====================
+
+    /**
+     * Un anticheat ou un plugin de protection annule cet evenement pour interdire le vol.
+     * En mode staff on le de-annule et on garde allowFlight actif.
+     * On ne force PAS setFlying(true) ici : le staff doit pouvoir se poser volontairement.
+     */
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onToggleFlight(PlayerToggleFlightEvent e) {
+        Player p = e.getPlayer();
+        if (!staffMode.contains(p.getUniqueId())) return;
+        if (e.isCancelled()) e.setCancelled(false);
+        try { if (!p.getAllowFlight()) p.setAllowFlight(true); } catch (Throwable ignored) {}
+    }
+
+    /** Tout changement de gamemode reinitialise allowFlight : on le repose. */
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onGameModeChange(PlayerGameModeChangeEvent e) {
+        if (staffMode.contains(e.getPlayer().getUniqueId())) applyStaffFlightLater(e.getPlayer());
+    }
+
+    /** Le respawn remet le joueur a l'etat par defaut (donc sans fly). */
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onRespawn(PlayerRespawnEvent e) {
+        if (staffMode.contains(e.getPlayer().getUniqueId())) applyStaffFlightLater(e.getPlayer());
+    }
+
+    /** Changement de monde : le fly saute tres souvent (surtout avec Multiverse). */
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onWorldChange(PlayerChangedWorldEvent e) {
+        if (staffMode.contains(e.getPlayer().getUniqueId())) applyStaffFlightLater(e.getPlayer());
+    }
+
+    /** Une teleportation peut couper le vol selon la distance et le plugin qui la declenche. */
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onTeleport(PlayerTeleportEvent e) {
+        if (staffMode.contains(e.getPlayer().getUniqueId())) applyStaffFlightLater(e.getPlayer());
+    }
+
     // ===================== JOIN / QUIT / DEATH =====================
 
     @EventHandler
@@ -844,8 +1024,7 @@ public class StaffMode extends LoadedPlugin implements Listener {
             // On ne restaure PAS l'inventaire en direct : on garde tout sur disque et on
             // le rend a la reconnexion (comme apres un crash).
             staffMode.remove(u);
-            p.setFlying(false);
-            p.setAllowFlight(false);
+            clearStaffFlight(p);
             clearToggledGrades(p);
             applyRoleOnExit(p);
             pendingRestore.add(u);
@@ -876,7 +1055,8 @@ public class StaffMode extends LoadedPlugin implements Listener {
 
     private void startBackupTask() {
         if (!backupEnabled) return;
-        if (getHost() instanceof org.bukkit.plugin.Plugin plugin) {
+        org.bukkit.plugin.Plugin plugin = hostPlugin();
+        if (plugin != null) {
             long ticks = Math.max(200L, backupIntervalSeconds * 20L);
             try {
                 backupTaskId = Bukkit.getScheduler()
@@ -921,7 +1101,8 @@ public class StaffMode extends LoadedPlugin implements Listener {
 
         long time = System.currentTimeMillis();
         Runnable write = () -> writeSnapshot(u, name, time, reason, gm, level, sStorage, sArmor, sOff, sEnder);
-        if (async && getHost() instanceof org.bukkit.plugin.Plugin plugin) {
+        org.bukkit.plugin.Plugin plugin = hostPlugin();
+        if (async && plugin != null) {
             try { Bukkit.getScheduler().runTaskAsynchronously(plugin, write); return; } catch (Throwable ignored) {}
         }
         write.run();
