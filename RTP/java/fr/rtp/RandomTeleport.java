@@ -184,7 +184,7 @@ public class RandomTeleport extends LoadedPlugin {
 
         RtpMenu holder = new RtpMenu();
         Inventory inv = Bukkit.createInventory(holder, 27,
-                Component.text("RTP", NamedTextColor.DARK_PURPLE));
+                Component.text("ᴛéʟéᴘᴏʀᴛᴀᴛɪᴏɴ ᴀʟéᴀᴛᴏɪʀᴇ"));
         holder.inventory = inv;
 
         inv.setItem(SLOT_OVERWORLD, icon(Material.GRASS_BLOCK, "ᴏᴠᴇʀᴡᴏʀʟᴅ", NamedTextColor.GREEN,
