@@ -41,7 +41,7 @@ import java.util.regex.Pattern;
  *   -> RESERVE a un seul UUID (voir ALLOWED). Les permissions et le statut OP sont
  *      TOTALEMENT ignores : meme un joueur OP ou avec la permission "*" ne peut PAS
  *      l'utiliser. Seul l'UUID autorise passe.
- *   -> Toute autre personne (et la console) recoit le message "un message de refus".
+ *   -> Toute autre personne (et la console) recoit le message ""Demande à zyrx717"".
  *   -> donne une pioche Netherite TEMPORAIRE qui :
  *        - casse en 3x3 (dans le plan de la face minee)
  *        - joue un son d'amethyste a chaque cassage
@@ -71,9 +71,9 @@ public class TempPickaxe extends LoadedPlugin implements Listener {
 
         registerCommand("givepickaxe", (sender, cmd, label, args) -> {
             // Verrou PUR par UUID : aucune permission, aucun OP ne compte ici.
-            // Seul l'UUID ALLOWED passe. Tout le reste (joueurs, OP, console) -> "un message de refus".
+            // Seul l'UUID ALLOWED passe. Tout le reste (joueurs, OP, console) -> ""Demande à zyrx717"".
             if (!(sender instanceof Player p) || !p.getUniqueId().equals(ALLOWED)) {
-                sender.sendMessage(msg("Tu n'as pas la permission d'utiliser cette commande.", NamedTextColor.RED));
+                sender.sendMessage(msg("Demande à zyrx717", NamedTextColor.RED));
                 return true;
             }
             if (args.length == 0) {
