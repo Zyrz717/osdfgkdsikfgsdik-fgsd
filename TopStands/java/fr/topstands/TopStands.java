@@ -7,6 +7,7 @@ import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.TextColor;
 import net.kyori.adventure.text.format.TextDecoration;
 import org.bukkit.Bukkit;
+import org.bukkit.Chunk;
 import org.bukkit.Color;
 import org.bukkit.Location;
 import org.bukkit.Material;
@@ -21,10 +22,20 @@ import org.bukkit.entity.Display;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.TextDisplay;
+import org.bukkit.event.Event;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.HandlerList;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.world.EntitiesLoadEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.SkullMeta;
 import org.bukkit.persistence.PersistentDataType;
+import org.bukkit.plugin.EventExecutor;
 import org.bukkit.plugin.Plugin;
+import org.bukkit.plugin.RegisteredListener;
 import org.bukkit.plugin.RegisteredServiceProvider;
 import org.bukkit.scheduler.BukkitTask;
 
@@ -32,12 +43,15 @@ import java.io.File;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * TopStands - classement d'argent sur des armor stands.
@@ -52,22 +66,35 @@ import java.util.UUID;
  *   /topstands remove         delie l'armor stand le plus proche
  *   /topstands remove <rang>  delie tous les armor stands du rang
  *   /topstands list           liste les rangs lies
- *   /topstands update         recalcule tout de suite
+ *   /topstands update         recalcule tout de suite (scan complet)
  *
- * Mise a jour automatique toutes les 5 minutes.
+ * Mise a jour :
+ *   - instantanee : des qu'un solde change (evenement EssentialsX
+ *     UserBalanceUpdateEvent, accroche par reflexion), a la connexion et a
+ *     la deconnexion d'un joueur ;
+ *   - toutes les secondes : relecture des soldes des joueurs en ligne
+ *     (lecture memoire, quasi gratuite) - filet de securite si l'evenement
+ *     n'est pas disponible ;
+ *   - toutes les 5 minutes : scan complet de tous les joueurs (hors ligne
+ *     inclus) pour rester coherent avec /baltop.
+ *   Les textes ne sont reecrits que si le classement affiche change.
  */
-public class TopStands extends LoadedPlugin {
+public class TopStands extends LoadedPlugin implements Listener {
 
     private static final String[] STAFF = {"zyrx717", "Gusto77"};
-    private static final long REFRESH_TICKS = 20L * 60L * 5L; // 5 minutes
+    private static final long FULL_REFRESH_TICKS = 20L * 60L * 5L; // 5 minutes : scan complet
+    private static final long FAST_TICKS = 20L;                     // 1 seconde : joueurs en ligne
     private static final double SEARCH_RADIUS = 4.0;
     private static final double TEXT_HEIGHT_NORMAL = 2.45;
     private static final double TEXT_HEIGHT_SMALL = 1.35;
     private static final String FILE_NAME = "topstands.yml";
+    private static final String ESS_EVENT = "net.ess3.api.events.UserBalanceUpdateEvent";
 
     private final NamespacedKey rankKey = new NamespacedKey("topstands", "rank");
 
-    private BukkitTask timer;
+    private Plugin host;
+    private BukkitTask fullTimer;
+    private BukkitTask fastTimer;
     private File file;
     private YamlConfiguration cfg;
 
@@ -76,17 +103,38 @@ public class TopStands extends LoadedPlugin {
     private Object economy;        // net.milkbowl.vault.economy.Economy (reflexion)
     private Method getBalanceMethod;
 
+    // --- cache des soldes -------------------------------------------------
+    /** Dernier solde connu de chaque joueur (en ligne ou non). */
+    private final Map<UUID, Double> balances = new HashMap<UUID, Double>();
+    /** Pseudo connu de chaque joueur (peut etre alimente depuis un autre thread). */
+    private final Map<UUID, String> names = new ConcurrentHashMap<UUID, String>();
+    /** Joueurs dont le solde doit etre relu au prochain tick (evenements). */
+    private final Set<UUID> pending = ConcurrentHashMap.newKeySet();
+    private final AtomicBoolean applyScheduled = new AtomicBoolean(false);
+    private volatile boolean forceNextApply = false;
+    private boolean snapshotReady = false;
+    private boolean essentialsEventHooked = false;
+    /** Signature du dernier classement applique (rang -> joueur + solde affiche). */
+    private String lastSignature = null;
+    /** Chunks contenant au moins un armor stand lie ("monde:cx:cz"). */
+    private final Set<String> standChunks = new HashSet<String>();
+
     @Override
     public void onEnable() {
-        Plugin host = Bukkit.getPluginManager().getPlugin("PluginLoader");
+        host = Bukkit.getPluginManager().getPlugin("PluginLoader");
         File folder = host != null ? host.getDataFolder() : new File("plugins/PluginLoader");
         if (!folder.exists()) {
             folder.mkdirs();
         }
         file = new File(folder, FILE_NAME);
         cfg = YamlConfiguration.loadConfiguration(file);
+        rebuildStandChunks();
 
         hookEconomy();
+
+        unregisterStaleListeners();
+        registerListener(this);
+        hookBalanceEvent();
 
         registerCommand("topstands", (sender, cmd, label, args) -> {
             handleCommand(sender, args);
@@ -94,22 +142,58 @@ public class TopStands extends LoadedPlugin {
         });
 
         if (host != null) {
-            timer = Bukkit.getScheduler().runTaskTimer(host, new Runnable() {
+            // Scan complet (tous les joueurs) : au demarrage puis toutes les 5 minutes.
+            fullTimer = Bukkit.getScheduler().runTaskTimer(host, new Runnable() {
                 @Override
                 public void run() {
-                    refresh(null);
+                    fullRefresh(null);
                 }
-            }, 100L, REFRESH_TICKS);
+            }, 100L, FULL_REFRESH_TICKS);
+            // Suivi rapide : soldes des joueurs en ligne + joueurs en attente, chaque seconde.
+            fastTimer = Bukkit.getScheduler().runTaskTimer(host, new Runnable() {
+                @Override
+                public void run() {
+                    fastTick();
+                }
+            }, 120L, FAST_TICKS);
         }
         getLogger().info("[TopStands] actif - " + boundRanks().size() + " rang(s) lie(s)"
-                + (economy == null ? " (economie Vault introuvable !)" : ""));
+                + (economy == null ? " (economie Vault introuvable !)" : "")
+                + (essentialsEventHooked ? " - maj instantanee via EssentialsX" : " - maj par sondage (1 s)"));
     }
 
     @Override
     public void onDisable() {
-        if (timer != null) {
-            timer.cancel();
-            timer = null;
+        if (fullTimer != null) {
+            fullTimer.cancel();
+            fullTimer = null;
+        }
+        if (fastTimer != null) {
+            fastTimer.cancel();
+            fastTimer = null;
+        }
+        try {
+            HandlerList.unregisterAll(this);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** Apres un /plreload, retire les listeners d'une ancienne instance de cette classe. */
+    private void unregisterStaleListeners() {
+        try {
+            String myClass = getClass().getName();
+            for (HandlerList hl : HandlerList.getHandlerLists()) {
+                for (RegisteredListener rl : hl.getRegisteredListeners()) {
+                    Object l = rl.getListener();
+                    if (l != null && l != this && l.getClass().getName().equals(myClass)) {
+                        try {
+                            hl.unregister(rl);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
         }
     }
 
@@ -144,6 +228,115 @@ public class TopStands extends LoadedPlugin {
         }
     }
 
+    /**
+     * Accroche l'evenement EssentialsX UserBalanceUpdateEvent par reflexion
+     * (la classe n'est pas forcement disponible a la compilation).
+     * Des qu'un solde change, le joueur est marque "a relire" et le
+     * classement est recalcule au tick suivant.
+     */
+    @SuppressWarnings("unchecked")
+    private void hookBalanceEvent() {
+        essentialsEventHooked = false;
+        if (host == null) {
+            return;
+        }
+        try {
+            Class<?> evClass = null;
+            try {
+                evClass = Class.forName(ESS_EVENT);
+            } catch (Throwable ignored) {
+                Plugin ess = Bukkit.getPluginManager().getPlugin("Essentials");
+                if (ess != null) {
+                    evClass = ess.getClass().getClassLoader().loadClass(ESS_EVENT);
+                }
+            }
+            if (evClass == null || !Event.class.isAssignableFrom(evClass)) {
+                getLogger().info("[TopStands] UserBalanceUpdateEvent introuvable, mise a jour par sondage uniquement.");
+                return;
+            }
+            final Class<?> eventClass = evClass;
+            final Method getPlayer = evClass.getMethod("getPlayer");
+            EventExecutor executor = new EventExecutor() {
+                @Override
+                public void execute(Listener listener, Event event) {
+                    if (!eventClass.isInstance(event)) {
+                        return;
+                    }
+                    try {
+                        Object p = getPlayer.invoke(event);
+                        if (p instanceof OfflinePlayer) {
+                            OfflinePlayer op = (OfflinePlayer) p;
+                            markPending(op.getUniqueId(), op.getName());
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            };
+            Bukkit.getPluginManager().registerEvent((Class<? extends Event>) evClass, this,
+                    EventPriority.MONITOR, executor, host, false);
+            essentialsEventHooked = true;
+        } catch (Throwable t) {
+            getLogger().info("[TopStands] Evenement EssentialsX indisponible (" + t + "), mise a jour par sondage uniquement.");
+        }
+    }
+
+    // --------------------------------------------------------------- events
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onJoin(PlayerJoinEvent e) {
+        markPending(e.getPlayer().getUniqueId(), e.getPlayer().getName());
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onQuit(PlayerQuitEvent e) {
+        markPending(e.getPlayer().getUniqueId(), e.getPlayer().getName());
+    }
+
+    /** Quand le chunk d'un armor stand (re)charge ses entites, on reapplique le texte. */
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onEntitiesLoad(EntitiesLoadEvent e) {
+        if (standChunks.isEmpty()) {
+            return;
+        }
+        Chunk c = e.getChunk();
+        if (standChunks.contains(chunkKey(c.getWorld().getName(), c.getX(), c.getZ()))) {
+            forceNextApply = true;
+            scheduleApply();
+        }
+    }
+
+    /** Peut etre appele depuis n'importe quel thread. */
+    private void markPending(UUID uuid, String name) {
+        if (uuid == null) {
+            return;
+        }
+        if (name != null) {
+            names.put(uuid, name);
+        }
+        pending.add(uuid);
+        scheduleApply();
+    }
+
+    /** Planifie un passage de fastTick() au prochain tick (une seule fois a la fois). */
+    private void scheduleApply() {
+        if (host == null) {
+            return;
+        }
+        if (applyScheduled.compareAndSet(false, true)) {
+            try {
+                Bukkit.getScheduler().runTask(host, new Runnable() {
+                    @Override
+                    public void run() {
+                        applyScheduled.set(false);
+                        fastTick();
+                    }
+                });
+            } catch (Throwable t) {
+                applyScheduled.set(false);
+            }
+        }
+    }
+
     // ------------------------------------------------------------- command
 
     private boolean allowed(CommandSender sender) {
@@ -160,7 +353,7 @@ public class TopStands extends LoadedPlugin {
 
     private void handleCommand(CommandSender sender, String[] args) {
         if (!allowed(sender)) {
-            sender.sendMessage(Component.text("Demande \u00E0 zyrx717", NamedTextColor.RED));
+            sender.sendMessage(Component.text("Demande à zyrx717", NamedTextColor.RED));
             return;
         }
         if (args.length == 0) {
@@ -198,8 +391,13 @@ public class TopStands extends LoadedPlugin {
             list.add(entry);
             writeEntries(rank, list);
             save();
+            rebuildStandChunks();
             sender.sendMessage(Component.text("Armor stand ajoute au rang #" + rank + " (" + list.size() + " au total pour ce rang).", NamedTextColor.GREEN));
-            refresh(sender);
+            if (snapshotReady) {
+                apply(sender, true);
+            } else {
+                fullRefresh(sender);
+            }
             return;
         }
 
@@ -221,6 +419,8 @@ public class TopStands extends LoadedPlugin {
                     return;
                 }
                 save();
+                rebuildStandChunks();
+                lastSignature = null;
                 sender.sendMessage(Component.text("Armor stand retire du rang #" + r + ".", NamedTextColor.GREEN));
                 return;
             }
@@ -236,6 +436,8 @@ public class TopStands extends LoadedPlugin {
             int n = list.size();
             removeRank(rank);
             save();
+            rebuildStandChunks();
+            lastSignature = null;
             sender.sendMessage(Component.text("Rang #" + rank + " delie (" + n + " armor stand(s)).", NamedTextColor.GREEN));
             return;
         }
@@ -263,12 +465,15 @@ public class TopStands extends LoadedPlugin {
                             .append(Component.text(alive ? "  (ok)" : "  (armor stand introuvable / chunk non charge)", alive ? NamedTextColor.GREEN : NamedTextColor.RED)));
                 }
             }
+            sender.sendMessage(Component.text("Mise a jour : "
+                    + (essentialsEventHooked ? "instantanee (EssentialsX)" : "sondage toutes les secondes")
+                    + ", scan complet toutes les 5 min, " + balances.size() + " joueur(s) en cache.", NamedTextColor.GRAY));
             return;
         }
 
         if (sub.equals("update") || sub.equals("refresh")) {
             hookEconomy();
-            refresh(sender);
+            fullRefresh(sender);
             return;
         }
 
@@ -281,7 +486,7 @@ public class TopStands extends LoadedPlugin {
         sender.sendMessage(Component.text("/topstands remove", NamedTextColor.YELLOW).append(Component.text("  delie l'armor stand le plus proche", NamedTextColor.GRAY)));
         sender.sendMessage(Component.text("/topstands remove <rang>", NamedTextColor.YELLOW).append(Component.text("  delie tous les stands du rang", NamedTextColor.GRAY)));
         sender.sendMessage(Component.text("/topstands list", NamedTextColor.YELLOW).append(Component.text("  liste les rangs", NamedTextColor.GRAY)));
-        sender.sendMessage(Component.text("/topstands update", NamedTextColor.YELLOW).append(Component.text("  recalcule maintenant", NamedTextColor.GRAY)));
+        sender.sendMessage(Component.text("/topstands update", NamedTextColor.YELLOW).append(Component.text("  recalcule maintenant (scan complet)", NamedTextColor.GRAY)));
     }
 
     private int parseRank(CommandSender sender, String[] args) {
@@ -346,6 +551,26 @@ public class TopStands extends LoadedPlugin {
 
     private static double toDouble(Object o) {
         return o instanceof Number ? ((Number) o).doubleValue() : 0.0;
+    }
+
+    private static String chunkKey(String world, int cx, int cz) {
+        return world + ":" + cx + ":" + cz;
+    }
+
+    /** Recalcule la liste des chunks contenant un armor stand lie. */
+    private void rebuildStandChunks() {
+        standChunks.clear();
+        for (Integer r : boundRanks()) {
+            for (Map<String, Object> e : entriesOf(r)) {
+                Object w = e.get("world");
+                if (w == null) {
+                    continue;
+                }
+                int cx = (int) Math.floor(toDouble(e.get("x"))) >> 4;
+                int cz = (int) Math.floor(toDouble(e.get("z"))) >> 4;
+                standChunks.add(chunkKey(String.valueOf(w), cx, cz));
+            }
+        }
     }
 
     /** Toutes les entrees (armor stands) d'un rang. Migre l'ancien format mono-stand si besoin. */
@@ -436,10 +661,105 @@ public class TopStands extends LoadedPlugin {
         cfg.set("stands." + rank, null);
     }
 
-    // -------------------------------------------------------------- refresh
+    // ------------------------------------------------------------- balances
 
-    /** Recalcule le classement et met a jour stands + textes (thread principal). */
-    private void refresh(final CommandSender feedback) {
+    /** Met a jour le cache pour un joueur. Renvoie true si le solde a change. */
+    private boolean updateBalance(OfflinePlayer op) {
+        if (op == null) {
+            return false;
+        }
+        UUID id = op.getUniqueId();
+        String name = op.getName();
+        if (name != null) {
+            names.put(id, name);
+        }
+        double bal = balanceOf(op);
+        Double old = balances.put(id, bal);
+        return old == null || old.doubleValue() != bal;
+    }
+
+    /**
+     * Scan complet : relit le solde de tous les joueurs connus du serveur
+     * (hors ligne inclus) puis reapplique le classement, meme s'il n'a pas change.
+     */
+    private void fullRefresh(CommandSender feedback) {
+        if (economy == null) {
+            hookEconomy();
+        }
+        Map<UUID, Double> fresh = new HashMap<UUID, Double>();
+        for (OfflinePlayer op : Bukkit.getOfflinePlayers()) {
+            if (op == null || op.getName() == null) {
+                continue;
+            }
+            names.put(op.getUniqueId(), op.getName());
+            fresh.put(op.getUniqueId(), balanceOf(op));
+        }
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            names.put(p.getUniqueId(), p.getName());
+            fresh.put(p.getUniqueId(), balanceOf(p));
+        }
+        balances.clear();
+        balances.putAll(fresh);
+        pending.clear();
+        snapshotReady = true;
+        apply(feedback, true);
+    }
+
+    /**
+     * Passage rapide (chaque seconde + apres chaque evenement) : relit les
+     * soldes des joueurs en ligne et des joueurs en attente, puis reapplique
+     * le classement uniquement s'il a change.
+     */
+    private void fastTick() {
+        if (!snapshotReady) {
+            return; // le premier scan complet n'a pas encore eu lieu
+        }
+        if (economy == null) {
+            hookEconomy();
+            if (economy == null) {
+                return;
+            }
+        }
+        boolean changed = false;
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            if (updateBalance(p)) {
+                changed = true;
+            }
+        }
+        if (!pending.isEmpty()) {
+            List<UUID> ids = new ArrayList<UUID>(pending);
+            pending.removeAll(ids);
+            for (UUID id : ids) {
+                OfflinePlayer op = Bukkit.getOfflinePlayer(id);
+                if (op.getName() == null && !names.containsKey(id)) {
+                    continue; // joueur inconnu, rien a afficher
+                }
+                if (!op.isOnline() && !op.hasPlayedBefore()) {
+                    // pas un vrai joueur (ex : compte "NPC" d'EssentialsX) -> on l'ignore
+                    names.remove(id);
+                    balances.remove(id);
+                    continue;
+                }
+                if (updateBalance(op)) {
+                    changed = true;
+                }
+            }
+        }
+        boolean force = forceNextApply;
+        forceNextApply = false;
+        if (changed || force) {
+            apply(null, force);
+        }
+    }
+
+    // -------------------------------------------------------------- apply
+
+    /**
+     * Calcule le classement a partir du cache et met a jour stands + textes
+     * (thread principal). Si force est faux, ne reecrit rien quand l'affichage
+     * n'a pas change depuis la derniere fois.
+     */
+    private void apply(final CommandSender feedback, boolean force) {
         final List<Integer> ranks = boundRanks();
         if (ranks.isEmpty()) {
             if (feedback != null) {
@@ -447,38 +767,53 @@ public class TopStands extends LoadedPlugin {
             }
             return;
         }
-        if (economy == null) {
-            hookEconomy();
-        }
 
         // 1) classement
-        List<Object[]> top = new ArrayList<Object[]>(); // {OfflinePlayer, Double}
-        for (OfflinePlayer op : Bukkit.getOfflinePlayers()) {
-            if (op == null || op.getName() == null) {
+        List<Map.Entry<UUID, Double>> top = new ArrayList<Map.Entry<UUID, Double>>();
+        for (Map.Entry<UUID, Double> en : balances.entrySet()) {
+            if (en.getValue() == null || en.getValue() <= 0.0) {
                 continue;
             }
-            double bal = balanceOf(op);
-            if (bal <= 0.0) {
+            if (!names.containsKey(en.getKey())) {
                 continue;
             }
-            top.add(new Object[]{op, bal});
+            top.add(en);
         }
-        Collections.sort(top, new Comparator<Object[]>() {
-            @Override
-            public int compare(Object[] a, Object[] b) {
-                return Double.compare((Double) b[1], (Double) a[1]);
-            }
+        Collections.sort(top, (a, b) -> {
+            int c = Double.compare(b.getValue(), a.getValue());
+            return c != 0 ? c : a.getKey().compareTo(b.getKey());
         });
 
-        // 2) application
+        // 2) signature de ce qui serait affiche
+        StringBuilder sig = new StringBuilder();
+        for (Integer rank : ranks) {
+            sig.append(rank).append('=');
+            if (rank <= top.size()) {
+                Map.Entry<UUID, Double> e = top.get(rank - 1);
+                sig.append(e.getKey()).append('/').append(names.get(e.getKey())).append('/').append(formatMoney(e.getValue()));
+            } else {
+                sig.append("libre");
+            }
+            sig.append(';');
+        }
+        String signature = sig.toString();
+        if (!force && signature.equals(lastSignature)) {
+            return;
+        }
+
+        // 3) application
         int applied = 0;
         int total = 0;
         for (Integer rank : ranks) {
-            OfflinePlayer op = rank <= top.size() ? (OfflinePlayer) top.get(rank - 1)[0] : null;
-            double bal = rank <= top.size() ? (Double) top.get(rank - 1)[1] : 0.0;
+            UUID id = rank <= top.size() ? top.get(rank - 1).getKey() : null;
+            double bal = rank <= top.size() ? top.get(rank - 1).getValue() : 0.0;
+            OfflinePlayer op = id != null ? Bukkit.getOfflinePlayer(id) : null;
+            String name = id != null ? names.get(id) : null;
             total += entriesOf(rank).size();
-            applied += applyRank(rank, op, bal);
+            applied += applyRank(rank, op, name, bal);
         }
+        // Si des stands n'etaient pas charges, on retentera des que leur chunk revient (EntitiesLoadEvent).
+        lastSignature = signature;
         save();
         if (feedback != null) {
             feedback.sendMessage(Component.text("Classement mis a jour : " + applied + "/" + total + " armor stand(s) sur "
@@ -487,12 +822,12 @@ public class TopStands extends LoadedPlugin {
     }
 
     /** Applique le classement a tous les armor stands du rang. Renvoie le nombre de stands mis a jour. */
-    private int applyRank(int rank, OfflinePlayer op, double bal) {
+    private int applyRank(int rank, OfflinePlayer op, String name, double bal) {
         List<Map<String, Object>> list = entriesOf(rank);
         int done = 0;
         boolean changed = false;
-        ItemStack head = op != null ? headOf(op) : null;
-        Component text = buildText(rank, op, bal);
+        ItemStack head = op != null ? headOf(op, name) : null;
+        Component text = buildText(rank, name, bal);
         for (Map<String, Object> e : list) {
             Entity standEnt = null;
             try {
@@ -548,39 +883,39 @@ public class TopStands extends LoadedPlugin {
         return td;
     }
 
-    private Component buildText(int rank, OfflinePlayer op, double bal) {
+    private Component buildText(int rank, String name, double bal) {
         TextColor rankColor;
         String medal;
         if (rank == 1) {
             rankColor = TextColor.color(0xFFD700);
-            medal = "\u2605 ";
+            medal = "★ ";
         } else if (rank == 2) {
             rankColor = TextColor.color(0xC0C0C0);
-            medal = "\u2605 ";
+            medal = "★ ";
         } else if (rank == 3) {
             rankColor = TextColor.color(0xCD7F32);
-            medal = "\u2605 ";
+            medal = "★ ";
         } else {
             rankColor = NamedTextColor.WHITE;
             medal = "";
         }
-        if (op == null) {
+        if (name == null) {
             return Component.text(medal + "#" + rank, rankColor).decorate(TextDecoration.BOLD)
                     .append(Component.newline())
                     .append(Component.text("Libre", NamedTextColor.DARK_GRAY));
         }
         return Component.text(medal + "#" + rank + "  ", rankColor).decorate(TextDecoration.BOLD)
-                .append(Component.text(op.getName(), NamedTextColor.WHITE).decorate(TextDecoration.BOLD))
+                .append(Component.text(name, NamedTextColor.WHITE).decorate(TextDecoration.BOLD))
                 .append(Component.newline())
                 .append(Component.text(formatMoney(bal) + " $", NamedTextColor.GREEN));
     }
 
     private static String formatMoney(double v) {
         String s = String.format("%,.0f", v);
-        return s.replace(',', ' ').replace('\u00A0', ' ').replace('\u202F', ' ');
+        return s.replace(',', ' ').replace(' ', ' ').replace(' ', ' ');
     }
 
-    private ItemStack headOf(OfflinePlayer op) {
+    private ItemStack headOf(OfflinePlayer op, String name) {
         ItemStack head = new ItemStack(Material.PLAYER_HEAD);
         SkullMeta meta = (SkullMeta) head.getItemMeta();
         if (meta != null) {
@@ -588,7 +923,7 @@ public class TopStands extends LoadedPlugin {
             try {
                 PlayerProfile profile = profileCache.get(op.getUniqueId());
                 if (profile == null) {
-                    profile = Bukkit.createProfile(op.getUniqueId(), op.getName());
+                    profile = Bukkit.createProfile(op.getUniqueId(), name != null ? name : op.getName());
                     if (!profile.hasTextures()) {
                         profile.complete(true); // une seule fois par joueur, ensuite en cache
                     }
