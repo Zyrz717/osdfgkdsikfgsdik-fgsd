@@ -34,6 +34,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -46,8 +47,10 @@ import java.util.UUID;
  * Le solde vient de l'economie Vault (EssentialsX sur ce serveur).
  *
  * Commandes (OP, ou zyrx717 / Gusto77) :
- *   /topstands set <rang>     lie l'armor stand le plus proche (4 blocs) au rang
- *   /topstands remove <rang>  delie un rang et retire son texte
+ *   /topstands set <rang>     ajoute l'armor stand le plus proche (4 blocs) au rang
+ *                             (un meme rang peut avoir plusieurs armor stands)
+ *   /topstands remove         delie l'armor stand le plus proche
+ *   /topstands remove <rang>  delie tous les armor stands du rang
  *   /topstands list           liste les rangs lies
  *   /topstands update         recalcule tout de suite
  *
@@ -181,40 +184,59 @@ public class TopStands extends LoadedPlugin {
                 sender.sendMessage(Component.text("Aucun armor stand a moins de 4 blocs de toi.", NamedTextColor.RED));
                 return;
             }
-            // si ce stand etait lie a un autre rang, on nettoie l'ancien
-            for (Integer r : boundRanks()) {
-                if (stand.getUniqueId().toString().equals(cfg.getString("stands." + r + ".stand"))) {
-                    removeRank(r);
-                }
-            }
-            // si ce rang avait deja un stand, on retire l'ancien texte
-            removeRank(rank);
+            // si ce stand etait deja lie (a ce rang ou un autre), on le delie d'abord
+            unbindStand(stand.getUniqueId().toString());
 
             Location l = stand.getLocation();
-            String base = "stands." + rank + ".";
-            cfg.set(base + "stand", stand.getUniqueId().toString());
-            cfg.set(base + "world", l.getWorld().getName());
-            cfg.set(base + "x", l.getX());
-            cfg.set(base + "y", l.getY());
-            cfg.set(base + "z", l.getZ());
+            Map<String, Object> entry = new LinkedHashMap<String, Object>();
+            entry.put("stand", stand.getUniqueId().toString());
+            entry.put("world", l.getWorld().getName());
+            entry.put("x", l.getX());
+            entry.put("y", l.getY());
+            entry.put("z", l.getZ());
+            List<Map<String, Object>> list = entriesOf(rank);
+            list.add(entry);
+            writeEntries(rank, list);
             save();
-            sender.sendMessage(Component.text("Armor stand lie au rang #" + rank + ".", NamedTextColor.GREEN));
+            sender.sendMessage(Component.text("Armor stand ajoute au rang #" + rank + " (" + list.size() + " au total pour ce rang).", NamedTextColor.GREEN));
             refresh(sender);
             return;
         }
 
-        if (sub.equals("remove") || sub.equals("del") || sub.equals("delete")) {
+        if (sub.equals("remove") || sub.equals("del") || sub.equals("delete") || sub.equals("unset")) {
+            if (args.length < 2) {
+                // sans rang : on delie l'armor stand le plus proche
+                if (!(sender instanceof Player)) {
+                    sender.sendMessage(Component.text("Depuis la console, precise un rang : /topstands remove <rang>", NamedTextColor.RED));
+                    return;
+                }
+                ArmorStand stand = nearestStand((Player) sender);
+                if (stand == null) {
+                    sender.sendMessage(Component.text("Aucun armor stand a moins de 4 blocs de toi.", NamedTextColor.RED));
+                    return;
+                }
+                int r = unbindStand(stand.getUniqueId().toString());
+                if (r < 0) {
+                    sender.sendMessage(Component.text("Cet armor stand n'est lie a aucun rang.", NamedTextColor.RED));
+                    return;
+                }
+                save();
+                sender.sendMessage(Component.text("Armor stand retire du rang #" + r + ".", NamedTextColor.GREEN));
+                return;
+            }
             int rank = parseRank(sender, args);
             if (rank < 1) {
                 return;
             }
-            if (!cfg.contains("stands." + rank)) {
+            List<Map<String, Object>> list = entriesOf(rank);
+            if (list.isEmpty()) {
                 sender.sendMessage(Component.text("Le rang #" + rank + " n'est lie a rien.", NamedTextColor.RED));
                 return;
             }
+            int n = list.size();
             removeRank(rank);
             save();
-            sender.sendMessage(Component.text("Rang #" + rank + " delie.", NamedTextColor.GREEN));
+            sender.sendMessage(Component.text("Rang #" + rank + " delie (" + n + " armor stand(s)).", NamedTextColor.GREEN));
             return;
         }
 
@@ -226,15 +248,20 @@ public class TopStands extends LoadedPlugin {
             }
             sender.sendMessage(Component.text("Rangs lies :", NamedTextColor.GOLD));
             for (Integer r : ranks) {
-                String base = "stands." + r + ".";
-                String where = cfg.getString(base + "world") + " "
-                        + (int) cfg.getDouble(base + "x") + " "
-                        + (int) cfg.getDouble(base + "y") + " "
-                        + (int) cfg.getDouble(base + "z");
-                boolean alive = Bukkit.getEntity(UUID.fromString(cfg.getString(base + "stand", UUID.randomUUID().toString()))) != null;
-                sender.sendMessage(Component.text(" #" + r + "  ", NamedTextColor.YELLOW)
-                        .append(Component.text(where, NamedTextColor.WHITE))
-                        .append(Component.text(alive ? "  (ok)" : "  (armor stand introuvable / chunk non charge)", alive ? NamedTextColor.GREEN : NamedTextColor.RED)));
+                for (Map<String, Object> e : entriesOf(r)) {
+                    String where = e.get("world") + " "
+                            + (int) toDouble(e.get("x")) + " "
+                            + (int) toDouble(e.get("y")) + " "
+                            + (int) toDouble(e.get("z"));
+                    boolean alive = false;
+                    try {
+                        alive = Bukkit.getEntity(UUID.fromString(String.valueOf(e.get("stand")))) != null;
+                    } catch (Throwable ignored) {
+                    }
+                    sender.sendMessage(Component.text(" #" + r + "  ", NamedTextColor.YELLOW)
+                            .append(Component.text(where, NamedTextColor.WHITE))
+                            .append(Component.text(alive ? "  (ok)" : "  (armor stand introuvable / chunk non charge)", alive ? NamedTextColor.GREEN : NamedTextColor.RED)));
+                }
             }
             return;
         }
@@ -250,8 +277,9 @@ public class TopStands extends LoadedPlugin {
 
     private void help(CommandSender sender) {
         sender.sendMessage(Component.text("TopStands", NamedTextColor.GOLD).decorate(TextDecoration.BOLD));
-        sender.sendMessage(Component.text("/topstands set <rang>", NamedTextColor.YELLOW).append(Component.text("  lie l'armor stand le plus proche", NamedTextColor.GRAY)));
-        sender.sendMessage(Component.text("/topstands remove <rang>", NamedTextColor.YELLOW).append(Component.text("  delie un rang", NamedTextColor.GRAY)));
+        sender.sendMessage(Component.text("/topstands set <rang>", NamedTextColor.YELLOW).append(Component.text("  ajoute l'armor stand le plus proche au rang", NamedTextColor.GRAY)));
+        sender.sendMessage(Component.text("/topstands remove", NamedTextColor.YELLOW).append(Component.text("  delie l'armor stand le plus proche", NamedTextColor.GRAY)));
+        sender.sendMessage(Component.text("/topstands remove <rang>", NamedTextColor.YELLOW).append(Component.text("  delie tous les stands du rang", NamedTextColor.GRAY)));
         sender.sendMessage(Component.text("/topstands list", NamedTextColor.YELLOW).append(Component.text("  liste les rangs", NamedTextColor.GRAY)));
         sender.sendMessage(Component.text("/topstands update", NamedTextColor.YELLOW).append(Component.text("  recalcule maintenant", NamedTextColor.GRAY)));
     }
@@ -316,27 +344,94 @@ public class TopStands extends LoadedPlugin {
         }
     }
 
-    private void removeRank(int rank) {
-        String base = "stands." + rank + ".";
-        String dispId = cfg.getString(base + "display");
-        if (dispId != null) {
+    private static double toDouble(Object o) {
+        return o instanceof Number ? ((Number) o).doubleValue() : 0.0;
+    }
+
+    /** Toutes les entrees (armor stands) d'un rang. Migre l'ancien format mono-stand si besoin. */
+    private List<Map<String, Object>> entriesOf(int rank) {
+        List<Map<String, Object>> out = new ArrayList<Map<String, Object>>();
+        String path = "stands." + rank;
+        if (cfg.isConfigurationSection(path)) {
+            // ancien format : une seule entree sous forme de section
+            ConfigurationSection sec = cfg.getConfigurationSection(path);
+            Map<String, Object> e = new LinkedHashMap<String, Object>();
+            for (String k : sec.getKeys(false)) {
+                e.put(k, sec.get(k));
+            }
+            if (e.containsKey("stand")) {
+                out.add(e);
+            }
+            return out;
+        }
+        for (Map<?, ?> m : cfg.getMapList(path)) {
+            Map<String, Object> e = new LinkedHashMap<String, Object>();
+            for (Map.Entry<?, ?> en : m.entrySet()) {
+                e.put(String.valueOf(en.getKey()), en.getValue());
+            }
+            if (e.containsKey("stand")) {
+                out.add(e);
+            }
+        }
+        return out;
+    }
+
+    private void writeEntries(int rank, List<Map<String, Object>> list) {
+        if (list.isEmpty()) {
+            cfg.set("stands." + rank, null);
+        } else {
+            cfg.set("stands." + rank, list);
+        }
+    }
+
+    /** Retire le texte et la tete d'une entree. */
+    private void cleanupEntry(Map<String, Object> e) {
+        Object disp = e.get("display");
+        if (disp != null) {
             try {
-                Entity e = Bukkit.getEntity(UUID.fromString(dispId));
-                if (e != null) {
-                    e.remove();
+                Entity ent = Bukkit.getEntity(UUID.fromString(String.valueOf(disp)));
+                if (ent != null) {
+                    ent.remove();
                 }
             } catch (Throwable ignored) {
             }
         }
-        String standId = cfg.getString(base + "stand");
-        if (standId != null) {
+        Object st = e.get("stand");
+        if (st != null) {
             try {
-                Entity e = Bukkit.getEntity(UUID.fromString(standId));
-                if (e instanceof ArmorStand) {
-                    ((ArmorStand) e).getEquipment().setHelmet(null);
+                Entity ent = Bukkit.getEntity(UUID.fromString(String.valueOf(st)));
+                if (ent instanceof ArmorStand) {
+                    ((ArmorStand) ent).getEquipment().setHelmet(null);
                 }
             } catch (Throwable ignored) {
             }
+        }
+    }
+
+    /** Delie un armor stand (par UUID) de son rang. Renvoie le rang, ou -1 s'il n'etait pas lie. */
+    private int unbindStand(String standId) {
+        int found = -1;
+        for (Integer r : boundRanks()) {
+            List<Map<String, Object>> list = entriesOf(r);
+            List<Map<String, Object>> keep = new ArrayList<Map<String, Object>>();
+            for (Map<String, Object> e : list) {
+                if (standId.equals(String.valueOf(e.get("stand")))) {
+                    cleanupEntry(e);
+                    found = r;
+                } else {
+                    keep.add(e);
+                }
+            }
+            if (keep.size() != list.size()) {
+                writeEntries(r, keep);
+            }
+        }
+        return found;
+    }
+
+    private void removeRank(int rank) {
+        for (Map<String, Object> e : entriesOf(rank)) {
+            cleanupEntry(e);
         }
         cfg.set("stands." + rank, null);
     }
@@ -377,64 +472,65 @@ public class TopStands extends LoadedPlugin {
 
         // 2) application
         int applied = 0;
+        int total = 0;
         for (Integer rank : ranks) {
             OfflinePlayer op = rank <= top.size() ? (OfflinePlayer) top.get(rank - 1)[0] : null;
             double bal = rank <= top.size() ? (Double) top.get(rank - 1)[1] : 0.0;
-            if (applyRank(rank, op, bal)) {
-                applied++;
-            }
+            total += entriesOf(rank).size();
+            applied += applyRank(rank, op, bal);
         }
         save();
         if (feedback != null) {
-            feedback.sendMessage(Component.text("Classement mis a jour : " + applied + "/" + ranks.size() + " rang(s), "
-                    + top.size() + " joueur(s) classes.", NamedTextColor.GREEN));
+            feedback.sendMessage(Component.text("Classement mis a jour : " + applied + "/" + total + " armor stand(s) sur "
+                    + ranks.size() + " rang(s), " + top.size() + " joueur(s) classes.", NamedTextColor.GREEN));
         }
     }
 
-    private boolean applyRank(int rank, OfflinePlayer op, double bal) {
-        String base = "stands." + rank + ".";
-        String standId = cfg.getString(base + "stand");
-        if (standId == null) {
-            return false;
-        }
-        Entity standEnt = null;
-        try {
-            standEnt = Bukkit.getEntity(UUID.fromString(standId));
-        } catch (Throwable ignored) {
-        }
-        if (!(standEnt instanceof ArmorStand)) {
-            return false; // chunk non charge ou stand detruit
-        }
-        ArmorStand stand = (ArmorStand) standEnt;
-
-        // tete
-        if (op != null) {
-            stand.getEquipment().setHelmet(headOf(op));
-        } else {
-            stand.getEquipment().setHelmet(null);
-        }
-
-        // texte
-        TextDisplay td = null;
-        String dispId = cfg.getString(base + "display");
-        if (dispId != null) {
+    /** Applique le classement a tous les armor stands du rang. Renvoie le nombre de stands mis a jour. */
+    private int applyRank(int rank, OfflinePlayer op, double bal) {
+        List<Map<String, Object>> list = entriesOf(rank);
+        int done = 0;
+        boolean changed = false;
+        ItemStack head = op != null ? headOf(op) : null;
+        Component text = buildText(rank, op, bal);
+        for (Map<String, Object> e : list) {
+            Entity standEnt = null;
             try {
-                Entity e = Bukkit.getEntity(UUID.fromString(dispId));
-                if (e instanceof TextDisplay) {
-                    td = (TextDisplay) e;
-                }
+                standEnt = Bukkit.getEntity(UUID.fromString(String.valueOf(e.get("stand"))));
             } catch (Throwable ignored) {
             }
+            if (!(standEnt instanceof ArmorStand)) {
+                continue; // chunk non charge ou stand detruit
+            }
+            ArmorStand stand = (ArmorStand) standEnt;
+            stand.getEquipment().setHelmet(head == null ? null : head.clone());
+
+            TextDisplay td = null;
+            Object dispId = e.get("display");
+            if (dispId != null) {
+                try {
+                    Entity d = Bukkit.getEntity(UUID.fromString(String.valueOf(dispId)));
+                    if (d instanceof TextDisplay) {
+                        td = (TextDisplay) d;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            Location target = stand.getLocation().clone().add(0.0, stand.isSmall() ? TEXT_HEIGHT_SMALL : TEXT_HEIGHT_NORMAL, 0.0);
+            if (td == null) {
+                td = spawnDisplay(target, rank);
+                e.put("display", td.getUniqueId().toString());
+                changed = true;
+            } else if (td.getLocation().distanceSquared(target) > 0.01) {
+                td.teleport(target);
+            }
+            td.text(text);
+            done++;
         }
-        Location target = stand.getLocation().clone().add(0.0, stand.isSmall() ? TEXT_HEIGHT_SMALL : TEXT_HEIGHT_NORMAL, 0.0);
-        if (td == null) {
-            td = spawnDisplay(target, rank);
-            cfg.set(base + "display", td.getUniqueId().toString());
-        } else if (td.getLocation().distanceSquared(target) > 0.01) {
-            td.teleport(target);
+        if (changed) {
+            writeEntries(rank, list);
         }
-        td.text(buildText(rank, op, bal));
-        return true;
+        return done;
     }
 
     private TextDisplay spawnDisplay(Location loc, int rank) {
