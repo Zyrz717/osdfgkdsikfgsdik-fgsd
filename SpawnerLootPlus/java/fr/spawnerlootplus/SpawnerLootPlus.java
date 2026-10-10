@@ -109,7 +109,7 @@ public class SpawnerLootPlus extends LoadedPlugin {
             add(table, ctor, stringKeys, "DROWNED", d("ROTTEN_FLESH", 0, 2, 1.0), d("COPPER_INGOT", 0, 1, 0.11));
             add(table, ctor, stringKeys, "BOGGED", d("BONE", 0, 2, 1.0), d("ARROW", 0, 2, 1.0), d("BROWN_MUSHROOM", 0, 1, 0.5));
             add(table, ctor, stringKeys, "ZOMBIE_VILLAGER", d("ROTTEN_FLESH", 0, 2, 1.0), d("EMERALD", 0, 1, 0.10));
-            add(table, ctor, stringKeys, "VILLAGER", d("EMERALD", 0, 1, 0.30));
+            add(table, ctor, stringKeys, "VILLAGER", d("EMERALD", 1, 2, 1.0));
             add(table, ctor, stringKeys, "WANDERING_TRADER", d("EMERALD", 0, 1, 0.40));
             add(table, ctor, stringKeys, "PHANTOM", d("PHANTOM_MEMBRANE", 0, 1, 1.0));
             add(table, ctor, stringKeys, "SHULKER", d("SHULKER_SHELL", 0, 1, 0.50));
