@@ -135,6 +135,11 @@ public class SpawnerLootPlus extends LoadedPlugin {
             add(table, ctor, stringKeys, "PARROT", d("FEATHER", 1, 2, 1.0));
             add(table, ctor, stringKeys, "ARMADILLO", d("ARMADILLO_SCUTE", 1, 1, 0.50));
             add(table, ctor, stringKeys, "CREAKING", d("RESIN_CLUMP", 1, 1, 1.0));
+            add(table, ctor, stringKeys, "ENDER_DRAGON",
+                    d("EMERALD", 2, 5, 1.0),
+                    d("DRAGON_BREATH", 1, 3, 1.0),
+                    d("END_STONE", 2, 6, 0.60),
+                    d("DRAGON_EGG", 0, 1, 0.01));
 
             int added = table.size() - before;
             getLogger().info("[SpawnerLootPlus] " + added + " mobs ajoutes a la table de loot OptaShop (total " + table.size() + ").");
