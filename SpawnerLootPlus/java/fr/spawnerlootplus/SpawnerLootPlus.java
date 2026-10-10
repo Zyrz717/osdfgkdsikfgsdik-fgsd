@@ -98,7 +98,14 @@ public class SpawnerLootPlus extends LoadedPlugin {
 
             int before = table.size();
 
-            add(table, ctor, stringKeys, "WARDEN", d("SCULK_CATALYST", 1, 1, 1.0));
+            add(table, ctor, stringKeys, "WARDEN",
+                    d("SCULK", 2, 6, 1.0),
+                    d("SCULK_VEIN", 1, 4, 0.80),
+                    d("SCULK_SENSOR", 0, 1, 0.30),
+                    d("SCULK_CATALYST", 0, 1, 0.25),
+                    d("SCULK_SHRIEKER", 0, 1, 0.15),
+                    d("ECHO_SHARD", 0, 1, 0.10),
+                    d("CALIBRATED_SCULK_SENSOR", 0, 1, 0.05));
             add(table, ctor, stringKeys, "DROWNED", d("ROTTEN_FLESH", 0, 2, 1.0), d("COPPER_INGOT", 0, 1, 0.11));
             add(table, ctor, stringKeys, "BOGGED", d("BONE", 0, 2, 1.0), d("ARROW", 0, 2, 1.0), d("BROWN_MUSHROOM", 0, 1, 0.5));
             add(table, ctor, stringKeys, "ZOMBIE_VILLAGER", d("ROTTEN_FLESH", 0, 2, 1.0), d("EMERALD", 0, 1, 0.10));
@@ -154,9 +161,8 @@ public class SpawnerLootPlus extends LoadedPlugin {
             return;
         }
         Object key = stringKeys ? (Object) mobName : (Object) type;
-        if (table.containsKey(key)) {
-            return;
-        }
+        // Aucun de ces mobs ne fait partie des 23 entrees d origine d OptaShop :
+        // on ecrit sans condition, ce qui permet de corriger un loot avec /plreload.
         List<Object> list = new ArrayList<Object>();
         for (Object[] row : drops) {
             Material mat;
