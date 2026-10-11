@@ -58,6 +58,15 @@ public class RandomTeleport extends LoadedPlugin {
 
     private static final int WARMUP_SECONDS = 5;
 
+    /**
+     * Marge (en blocks) gardee entre le point d'arrivee et la bordure du monde.
+     * CORRECTIF : avant, la portee etait fixe (jusqu'a 12 500 blocks) alors que la
+     * bordure de l'Overworld fait 15 000 de large (+/- 7 500). Les joueurs etaient
+     * teleportes HORS de la bordure et mouraient (degats de bordure). La portee est
+     * maintenant calculee d'apres la bordure reelle de chaque monde.
+     */
+    private static final int BORDER_MARGIN = 48;
+
     /** Rayon interdit autour de 0,0 dans l'End (ile principale / dragon / fontaine). */
     private static final int END_FORBIDDEN_RADIUS = 2_000;
 
@@ -179,20 +188,18 @@ public class RandomTeleport extends LoadedPlugin {
 
     private void openMenu(Player player) {
         boolean vip = player.hasPermission("rtp.vip");
-        int min = vip ? VIP_MIN : BASIC_MIN;
-        int max = vip ? VIP_MAX : BASIC_MAX;
 
         RtpMenu holder = new RtpMenu();
         Inventory inv = Bukkit.createInventory(holder, 27,
                 Component.text("ᴛéʟéᴘᴏʀᴛᴀᴛɪᴏɴ ᴀʟéᴀᴛᴏɪʀᴇ"));
         holder.inventory = inv;
 
-        inv.setItem(SLOT_OVERWORLD, icon(Material.GRASS_BLOCK, "ᴏᴠᴇʀᴡᴏʀʟᴅ", NamedTextColor.GREEN,
-                World.Environment.NORMAL, min, max, vip));
-        inv.setItem(SLOT_NETHER, icon(Material.NETHERRACK, "ɴᴇᴛʜᴇʀ", NamedTextColor.RED,
-                World.Environment.NETHER, min, max, vip));
-        inv.setItem(SLOT_END, icon(Material.END_STONE, "ᴇɴᴅ", NamedTextColor.LIGHT_PURPLE,
-                World.Environment.THE_END, min, max, vip));
+        inv.setItem(SLOT_OVERWORLD, icon(player, Material.GRASS_BLOCK, "ᴏᴠᴇʀᴡᴏʀʟᴅ", NamedTextColor.GREEN,
+                World.Environment.NORMAL, vip));
+        inv.setItem(SLOT_NETHER, icon(player, Material.NETHERRACK, "ɴᴇᴛʜᴇʀ", NamedTextColor.RED,
+                World.Environment.NETHER, vip));
+        inv.setItem(SLOT_END, icon(player, Material.END_STONE, "ᴇɴᴅ", NamedTextColor.LIGHT_PURPLE,
+                World.Environment.THE_END, vip));
 
         try {
             player.openInventory(inv);
@@ -204,9 +211,11 @@ public class RandomTeleport extends LoadedPlugin {
         }
     }
 
-    private ItemStack icon(Material mat, String name, NamedTextColor color,
-                           World.Environment env, int min, int max, boolean vip) {
+    private ItemStack icon(Player player, Material mat, String name, NamedTextColor color,
+                           World.Environment env, boolean vip) {
         World world = findWorld(env);
+        int[] range = (world == null) ? new int[]{0, 0} : rangeFor(player, world);
+        int min = range[0], max = range[1];
 
         ItemStack item = new ItemStack(mat);
         ItemMeta meta = item.getItemMeta();
@@ -396,14 +405,22 @@ public class RandomTeleport extends LoadedPlugin {
             return;
         }
 
-        boolean vip = player.hasPermission("rtp.vip");
-        int min = vip ? VIP_MIN : BASIC_MIN;
-        int max = vip ? VIP_MAX : BASIC_MAX;
+        int[] range = rangeFor(player, world);
+        int min = range[0], max = range[1];
 
+        // Le point est tire autour du CENTRE de la bordure (0,0 en general), et
+        // dist <= demi-largeur de la bordure - marge : on reste toujours dedans.
+        Location center = world.getWorldBorder().getCenter();
         double angle = Math.random() * Math.PI * 2;
         int dist = min + (int) (Math.random() * (max - min + 1));
-        int x = (int) Math.round(Math.cos(angle) * dist);
-        int z = (int) Math.round(Math.sin(angle) * dist);
+        int x = (int) Math.round(center.getX() + Math.cos(angle) * dist);
+        int z = (int) Math.round(center.getZ() + Math.sin(angle) * dist);
+
+        // Double securite : jamais hors bordure (sinon le joueur prend des degats et meurt).
+        if (!insideBorder(world, x, z)) {
+            tryTeleport(player, world, attemptsLeft - 1);
+            return;
+        }
 
         // Securite : jamais l'ile principale de l'End (dragon / fontaine).
         if (world.getEnvironment() == World.Environment.THE_END
@@ -449,6 +466,30 @@ public class RandomTeleport extends LoadedPlugin {
     }
 
     // ---------------------------------------------------------------- utilitaires
+
+    /**
+     * Portee {min, max} pour ce joueur dans ce monde, LIMITEE a la bordure du monde.
+     * Ex : bordure 15 000 de large -> demi-largeur 7 500 -> max 7 452 (marge 48).
+     */
+    private int[] rangeFor(Player player, World world) {
+        boolean vip = player.hasPermission("rtp.vip");
+        int min = vip ? VIP_MIN : BASIC_MIN;
+        int max = vip ? VIP_MAX : BASIC_MAX;
+
+        double half = world.getWorldBorder().getSize() / 2.0 - BORDER_MARGIN;
+        if (half < 64) half = 64; // bordure minuscule : on fait au mieux
+        if (max > half) max = (int) half;
+        if (min >= max) min = Math.max(0, max / 2);
+        return new int[]{min, max};
+    }
+
+    /** Vrai si (x,z) est a l'interieur de la bordure du monde, marge comprise. */
+    private boolean insideBorder(World world, int x, int z) {
+        org.bukkit.WorldBorder border = world.getWorldBorder();
+        Location c = border.getCenter();
+        double half = border.getSize() / 2.0 - BORDER_MARGIN;
+        return Math.abs(x + 0.5 - c.getX()) <= half && Math.abs(z + 0.5 - c.getZ()) <= half;
+    }
 
     private int attemptsFor(World world) {
         return switch (world.getEnvironment()) {
