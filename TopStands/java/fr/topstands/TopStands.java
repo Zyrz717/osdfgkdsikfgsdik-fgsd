@@ -687,12 +687,31 @@ public class TopStands extends LoadedPlugin implements Listener {
             hookEconomy();
         }
         Map<UUID, Double> fresh = new HashMap<UUID, Double>();
+
+        // 1) Source principale : la liste des comptes d'EssentialsX, exactement
+        //    comme /baltop. CORRECTIF : avant, seul Bukkit.getOfflinePlayers() etait
+        //    utilise, et un joueur sans nom dans le cache du serveur (usercache.json,
+        //    frequent avec AuthMe / FastLogin / Floodgate) etait ignore -> des rangs
+        //    affiches "Libre" alors que /baltop montrait bien un joueur.
+        Map<UUID, String> essUsers = essentialsUsers();
+        for (Map.Entry<UUID, String> en : essUsers.entrySet()) {
+            names.put(en.getKey(), en.getValue());
+            fresh.put(en.getKey(), balanceOf(Bukkit.getOfflinePlayer(en.getKey())));
+        }
+
+        // 2) Complement : les joueurs connus de Bukkit (nom dans le cache serveur).
         for (OfflinePlayer op : Bukkit.getOfflinePlayers()) {
-            if (op == null || op.getName() == null) {
+            if (op == null) {
                 continue;
             }
-            names.put(op.getUniqueId(), op.getName());
-            fresh.put(op.getUniqueId(), balanceOf(op));
+            String name = op.getName() != null ? op.getName() : names.get(op.getUniqueId());
+            if (name == null) {
+                continue;
+            }
+            names.put(op.getUniqueId(), name);
+            if (!fresh.containsKey(op.getUniqueId())) {
+                fresh.put(op.getUniqueId(), balanceOf(op));
+            }
         }
         for (Player p : Bukkit.getOnlinePlayers()) {
             names.put(p.getUniqueId(), p.getName());
@@ -703,6 +722,80 @@ public class TopStands extends LoadedPlugin implements Listener {
         pending.clear();
         snapshotReady = true;
         apply(feedback, true);
+    }
+
+    /**
+     * Tous les comptes connus d'EssentialsX (uuid -> dernier pseudo), par reflexion
+     * pour ne pas dependre d'EssentialsX a la compilation. Compatible avec
+     * Essentials#getUsers().getAllUserUUIDs() (2.20+) et l'ancien
+     * Essentials#getUserMap().getAllUniqueUsers().
+     */
+    private Map<UUID, String> essentialsUsers() {
+        Map<UUID, String> out = new HashMap<UUID, String>();
+        try {
+            Plugin ess = Bukkit.getPluginManager().getPlugin("Essentials");
+            if (ess == null) {
+                return out;
+            }
+            Object users = null;
+            try {
+                users = ess.getClass().getMethod("getUsers").invoke(ess);
+            } catch (NoSuchMethodException e) {
+                users = ess.getClass().getMethod("getUserMap").invoke(ess);
+            }
+            if (users == null) {
+                return out;
+            }
+            Object ids = null;
+            for (String m : new String[]{"getAllUserUUIDs", "getAllUniqueUsers"}) {
+                try {
+                    ids = users.getClass().getMethod(m).invoke(users);
+                    break;
+                } catch (NoSuchMethodException ignored) {
+                }
+            }
+            if (!(ids instanceof Iterable)) {
+                return out;
+            }
+            Method getUser = ess.getClass().getMethod("getUser", UUID.class);
+            for (Object o : (Iterable<?>) ids) {
+                if (!(o instanceof UUID)) {
+                    continue;
+                }
+                UUID id = (UUID) o;
+                String name = null;
+                try {
+                    Object user = getUser.invoke(ess, id);
+                    if (user != null) {
+                        // Comptes "NPC" d'EssentialsX (boutiques, panneaux) : exclus comme dans /baltop.
+                        try {
+                            Object npc = user.getClass().getMethod("isNPC").invoke(user);
+                            if (Boolean.TRUE.equals(npc)) {
+                                continue;
+                            }
+                        } catch (NoSuchMethodException ignored) {
+                        }
+                        for (String m : new String[]{"getLastAccountName", "getName"}) {
+                            try {
+                                Object n = user.getClass().getMethod(m).invoke(user);
+                                if (n != null && !n.toString().isEmpty()) {
+                                    name = n.toString();
+                                    break;
+                                }
+                            } catch (NoSuchMethodException ignored) {
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                if (name != null) {
+                    out.put(id, name);
+                }
+            }
+        } catch (Throwable t) {
+            getLogger().info("[TopStands] liste des comptes EssentialsX indisponible (" + t + "), repli sur Bukkit.");
+        }
+        return out;
     }
 
     /**
@@ -734,9 +827,8 @@ public class TopStands extends LoadedPlugin implements Listener {
                 if (op.getName() == null && !names.containsKey(id)) {
                     continue; // joueur inconnu, rien a afficher
                 }
-                if (!op.isOnline() && !op.hasPlayedBefore()) {
+                if (!op.isOnline() && !op.hasPlayedBefore() && !names.containsKey(id)) {
                     // pas un vrai joueur (ex : compte "NPC" d'EssentialsX) -> on l'ignore
-                    names.remove(id);
                     balances.remove(id);
                     continue;
                 }
