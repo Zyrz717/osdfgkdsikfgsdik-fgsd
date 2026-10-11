@@ -140,6 +140,10 @@ public class SpawnerLootPlus extends LoadedPlugin {
                     d("DRAGON_BREATH", 1, 3, 1.0),
                     d("END_STONE", 2, 6, 0.60),
                     d("DRAGON_EGG", 0, 1, 0.01));
+            // Spawner Wither (crate Spawner) : charbon garanti + etoile du Nether rare.
+            add(table, ctor, stringKeys, "WITHER",
+                    d("COAL", 1, 3, 1.0),
+                    d("NETHER_STAR", 1, 1, 0.005));
 
             int added = table.size() - before;
             getLogger().info("[SpawnerLootPlus] " + added + " mobs ajoutes a la table de loot OptaShop (total " + table.size() + ").");
