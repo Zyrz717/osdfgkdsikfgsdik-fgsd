@@ -13,6 +13,7 @@ import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.event.inventory.InventoryOpenEvent;
 import org.bukkit.event.player.PlayerCommandPreprocessEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
@@ -20,6 +21,7 @@ import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.plugin.Plugin;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -47,6 +49,14 @@ import java.util.Map;
  * Pre-requis ItemsAdder : contents/optashop_ui (font image shop_main + item
  * invisible), puis /iazip. Sans ItemsAdder, le menu s'ouvre quand meme avec
  * un titre texte et des vitres grises a la place des zones invisibles.
+ *
+ * Les menus de CATEGORIE sont aussi remplaces : OptaShop n'affichait que les
+ * 9 premiers items d'une categorie (une seule ligne). Ici : 45 items par page
+ * (5 lignes), pagination, bouton retour vers le menu texture. L'affichage de
+ * chaque item (nom, prix d'achat, prix de vente) est celui d'OptaShop
+ * (ShopGUI.buildShopItem) et le clic ouvre son ecran d'achat (ShopGUI.openBuy).
+ * Quand OptaShop veut rouvrir son propre menu principal ou une categorie
+ * (bouton "Retour" de l'ecran d'achat, /shop...), on le remplace par le notre.
  */
 public class ShopUI extends LoadedPlugin implements Listener {
 
@@ -66,6 +76,19 @@ public class ShopUI extends LoadedPlugin implements Listener {
         final Map<Integer, String> slotToButton = new HashMap<>();
         @Override public Inventory getInventory() { return inv; }
     }
+
+    /** Menu d'une categorie (45 items par page). */
+    private static final class SectionHolder implements InventoryHolder {
+        Inventory inv;
+        Object section;            // net.optaland.shop.model.ShopSection
+        int page;
+        int pages;
+        final Map<Integer, Object> slotToItem = new HashMap<>(); // slot -> ShopItem
+        @Override public Inventory getInventory() { return inv; }
+    }
+
+    private static final int PER_PAGE = 45;
+    private static final int SLOT_PREV = 45, SLOT_BACK = 49, SLOT_NEXT = 53;
 
     private String cachedTitle;   // titre texture (calcule une fois)
     private ItemStack invisible;  // item invisible ItemsAdder (cache)
@@ -89,7 +112,8 @@ public class ShopUI extends LoadedPlugin implements Listener {
     public void onDisable() {
         try { HandlerList.unregisterAll(this); } catch (Throwable ignored) {}
         for (Player p : Bukkit.getOnlinePlayers()) {
-            if (p.getOpenInventory().getTopInventory().getHolder() instanceof Holder) p.closeInventory();
+            InventoryHolder h = p.getOpenInventory().getTopInventory().getHolder();
+            if (h instanceof Holder || h instanceof SectionHolder) p.closeInventory();
         }
     }
 
@@ -190,23 +214,146 @@ public class ShopUI extends LoadedPlugin implements Listener {
             p.sendMessage(Component.text("Cette categorie n'existe pas dans shop.yml.", NamedTextColor.RED));
             return;
         }
+        openSection(p, section, 0);
+    }
+
+    // ===================== MENU DE CATEGORIE =====================
+
+    @SuppressWarnings("unchecked")
+    private void openSection(Player p, Object section, int page) {
+        Object opta = optaShop();
+        if (opta == null) return;
+        List<Object> items = new ArrayList<>();
+        try {
+            Object list = section.getClass().getMethod("getItems").invoke(section);
+            for (Object o : (Iterable<Object>) list) items.add(o);
+        } catch (Throwable t) {
+            getLogger().warning("[ShopUI] lecture des items KO : " + t);
+            return;
+        }
+        int pages = Math.max(1, (items.size() + PER_PAGE - 1) / PER_PAGE);
+        page = Math.max(0, Math.min(page, pages - 1));
+
+        String rawTitle = "&8Boutique";
+        try { Object t = section.getClass().getMethod("getTitle").invoke(section); if (t != null) rawTitle = t.toString(); } catch (Throwable ignored) {}
+        Component title = net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer.legacyAmpersand().deserialize(rawTitle
+                + (pages > 1 ? " &8(" + (page + 1) + "/" + pages + ")" : ""));
+
+        SectionHolder holder = new SectionHolder();
+        holder.section = section; holder.page = page; holder.pages = pages;
+        Inventory inv = Bukkit.createInventory(holder, 54, title);
+        holder.inv = inv;
+
+        // items de la page
+        Method build = null;
+        try {
+            Object gui = opta.getClass().getMethod("getGui").invoke(opta);
+            int start = page * PER_PAGE;
+            for (int i = start; i < items.size() && i < start + PER_PAGE; i++) {
+                Object item = items.get(i);
+                if (build == null) {
+                    build = gui.getClass().getDeclaredMethod("buildShopItem", item.getClass());
+                    build.setAccessible(true);
+                }
+                Object stack = build.invoke(gui, item);
+                if (stack instanceof ItemStack is) {
+                    inv.setItem(i - start, is);
+                    holder.slotToItem.put(i - start, item);
+                }
+            }
+        } catch (Throwable t) {
+            getLogger().warning("[ShopUI] affichage des items KO : " + t);
+        }
+
+        // barre du bas
+        ItemStack filler = pane(Material.BLACK_STAINED_GLASS_PANE, " ");
+        for (int s = 45; s < 54; s++) inv.setItem(s, filler);
+        inv.setItem(SLOT_BACK, button(Material.ARROW, "« Retour", "Revenir au menu de la boutique"));
+        if (page > 0) inv.setItem(SLOT_PREV, button(Material.PAPER, "« Page precedente", "Page " + page + "/" + pages));
+        if (page < pages - 1) inv.setItem(SLOT_NEXT, button(Material.PAPER, "Page suivante »", "Page " + (page + 2) + "/" + pages));
+
+        p.openInventory(inv);
+    }
+
+    @EventHandler
+    public void onSectionClick(InventoryClickEvent e) {
+        if (!(e.getView().getTopInventory().getHolder() instanceof SectionHolder holder)) return;
+        e.setCancelled(true);
+        if (!(e.getWhoClicked() instanceof Player p)) return;
+        if (e.getClickedInventory() == null || !(e.getClickedInventory().getHolder() instanceof SectionHolder)) return;
+        int slot = e.getSlot();
+        if (slot == SLOT_BACK) { openMain(p); return; }
+        if (slot == SLOT_PREV && holder.page > 0) { openSection(p, holder.section, holder.page - 1); return; }
+        if (slot == SLOT_NEXT && holder.page < holder.pages - 1) { openSection(p, holder.section, holder.page + 1); return; }
+        Object item = holder.slotToItem.get(slot);
+        if (item == null) return;
+        Object opta = optaShop();
+        if (opta == null) return;
         try {
             Object gui = opta.getClass().getMethod("getGui").invoke(opta);
             Method open = null;
             for (Method m : gui.getClass().getMethods()) {
-                if (m.getName().equals("openSection") && m.getParameterCount() == 2) { open = m; break; }
+                if (m.getName().equals("openBuy") && m.getParameterCount() == 3) { open = m; break; }
             }
-            if (open == null) throw new NoSuchMethodException("openSection");
-            open.invoke(gui, p, section);
+            if (open == null) throw new NoSuchMethodException("openBuy");
+            open.invoke(gui, p, holder.section, item);
         } catch (Throwable t) {
-            getLogger().warning("[ShopUI] ouverture de la categorie " + id + " KO : " + t);
-            p.sendMessage(Component.text("Impossible d'ouvrir cette categorie.", NamedTextColor.RED));
+            getLogger().warning("[ShopUI] ouverture de l'ecran d'achat KO : " + t);
+            p.sendMessage(Component.text("Impossible d'ouvrir cet article.", NamedTextColor.RED));
         }
+    }
+
+    /**
+     * OptaShop veut ouvrir SON menu principal ou SA categorie (bouton Retour de
+     * l'ecran d'achat, /shop...) : on annule et on ouvre le notre au tick suivant.
+     */
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onOptaShopOpen(InventoryOpenEvent e) {
+        InventoryHolder h = e.getInventory().getHolder();
+        if (h == null) return;
+        String cls = h.getClass().getName();
+        if (!cls.startsWith("net.optaland.shop.gui.Holders$")) return;
+        if (!(e.getPlayer() instanceof Player p)) return;
+        if (cls.endsWith("$MainMenu")) {
+            e.setCancelled(true);
+            Bukkit.getScheduler().runTask(getHost(), () -> openMain(p));
+        } else if (cls.endsWith("$Section")) {
+            Object section = null;
+            try {
+                for (Field f : h.getClass().getDeclaredFields()) {
+                    if (f.getType().getName().endsWith("ShopSection")) { f.setAccessible(true); section = f.get(h); break; }
+                }
+            } catch (Throwable ignored) {}
+            if (section == null) return; // on laisse OptaShop faire
+            final Object sec = section;
+            e.setCancelled(true);
+            Bukkit.getScheduler().runTask(getHost(), () -> openSection(p, sec, 0));
+        }
+    }
+
+    private ItemStack pane(Material m, String name) {
+        ItemStack it = new ItemStack(m);
+        ItemMeta meta = it.getItemMeta();
+        meta.displayName(Component.text(name).decoration(TextDecoration.ITALIC, false));
+        it.setItemMeta(meta);
+        return it;
+    }
+
+    private ItemStack button(Material m, String name, String loreLine) {
+        ItemStack it = new ItemStack(m);
+        ItemMeta meta = it.getItemMeta();
+        meta.displayName(Component.text(name, NamedTextColor.WHITE, TextDecoration.BOLD).decoration(TextDecoration.ITALIC, false));
+        List<Component> lore = new ArrayList<>();
+        lore.add(line(loreLine, NamedTextColor.GRAY));
+        meta.lore(lore);
+        it.setItemMeta(meta);
+        return it;
     }
 
     @EventHandler
     public void onDrag(InventoryDragEvent e) {
-        if (e.getView().getTopInventory().getHolder() instanceof Holder) e.setCancelled(true);
+        InventoryHolder h = e.getView().getTopInventory().getHolder();
+        if (h instanceof Holder || h instanceof SectionHolder) e.setCancelled(true);
     }
 
     // ===================== OptaShop (reflexion) =====================
