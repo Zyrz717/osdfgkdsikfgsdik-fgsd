@@ -13,10 +13,15 @@ import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.Player;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.inventory.ItemFlag;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
@@ -26,11 +31,15 @@ import org.bukkit.plugin.Plugin;
 import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.util.RayTraceResult;
 
+import java.io.File;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -46,6 +55,9 @@ import java.util.regex.Pattern;
  *        - casse en 3x3 (dans le plan de la face minee)
  *        - joue un son d'amethyste a chaque cassage
  *        - s'auto-detruit apres la duree choisie (heure d'expiration ecrite dans le lore)
+ *        - est CONSERVEE a la mort : elle ne tombe pas au sol et revient dans
+ *          l'inventaire au respawn (meme apres une deconnexion ou un redemarrage,
+ *          la pioche en attente est sauvegardee dans temppickaxe-keep.yml).
  */
 public class TempPickaxe extends LoadedPlugin implements Listener {
 
@@ -62,12 +74,17 @@ public class TempPickaxe extends LoadedPlugin implements Listener {
 
     private BukkitTask purgeTask;
 
+    // Pioches retirees des drops a la mort, rendues au respawn (par joueur).
+    private final Map<UUID, List<ItemStack>> keptOnDeath = new ConcurrentHashMap<>();
+    private File keepFile;
+
     // ===================== CYCLE DE VIE =====================
 
     @Override
     public void onEnable() {
         unregisterStaleListeners();
         registerListener(this);
+        loadKept();
 
         registerCommand("givepickaxe", (sender, cmd, label, args) -> {
             // Verrou PUR par UUID : aucune permission, aucun OP ne compte ici.
@@ -228,6 +245,112 @@ public class TempPickaxe extends LoadedPlugin implements Listener {
         if (pitch > 45f) return BlockFace.UP;      // regarde le sol -> plan horizontal
         if (pitch < -45f) return BlockFace.DOWN;
         return p.getFacing(); // NORTH/EAST/SOUTH/WEST
+    }
+
+    // ===================== CONSERVATION A LA MORT =====================
+
+    /** A la mort : on retire nos pioches des drops et on les met de cote. */
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onDeath(PlayerDeathEvent e) {
+        try { if (e.getKeepInventory()) return; } catch (Throwable ignored) {}
+        Player p = e.getEntity();
+        List<ItemStack> kept = new ArrayList<>();
+        Iterator<ItemStack> it = e.getDrops().iterator();
+        while (it.hasNext()) {
+            ItemStack d = it.next();
+            if (isOurPickaxe(d)) {
+                kept.add(d.clone());
+                it.remove();
+            }
+        }
+        if (kept.isEmpty()) return;
+        keptOnDeath.computeIfAbsent(p.getUniqueId(), k -> new ArrayList<>()).addAll(kept);
+        saveKept();
+        p.sendMessage(msg("Ta pioche temporaire est conservee : tu la retrouveras au respawn.", NamedTextColor.LIGHT_PURPLE));
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onRespawn(PlayerRespawnEvent e) {
+        giveBackLater(e.getPlayer());
+    }
+
+    /** Si le joueur s'est deconnecte entre la mort et le respawn. */
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onJoin(PlayerJoinEvent e) {
+        giveBackLater(e.getPlayer());
+    }
+
+    private void giveBackLater(Player p) {
+        if (!keptOnDeath.containsKey(p.getUniqueId())) return;
+        try {
+            Bukkit.getScheduler().runTaskLater((Plugin) getHost(), () -> giveBack(p), 2L);
+        } catch (Throwable t) {
+            giveBack(p);
+        }
+    }
+
+    private void giveBack(Player p) {
+        if (!p.isOnline() || p.isDead()) return; // encore mort : on attend le respawn
+        List<ItemStack> list = keptOnDeath.remove(p.getUniqueId());
+        if (list == null || list.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        int given = 0;
+        for (ItemStack is : list) {
+            long ex = getExpire(is);
+            if (ex > 0 && now > ex) continue; // expiree entre-temps : on ne la rend pas
+            giveItem(p, is);
+            given++;
+        }
+        saveKept();
+        p.updateInventory();
+        if (given > 0) {
+            p.playSound(p.getLocation(), Sound.ENTITY_ITEM_PICKUP, 1f, 1.2f);
+            p.sendMessage(msg("Ta pioche temporaire t'a ete rendue.", NamedTextColor.LIGHT_PURPLE));
+        }
+    }
+
+    private File keepFile() {
+        if (keepFile == null) {
+            try { keepFile = new File(((Plugin) getHost()).getDataFolder(), "temppickaxe-keep.yml"); }
+            catch (Throwable t) { keepFile = new File("plugins/PluginLoader", "temppickaxe-keep.yml"); }
+        }
+        return keepFile;
+    }
+
+    private void saveKept() {
+        try {
+            File f = keepFile();
+            File dir = f.getParentFile();
+            if (dir != null && !dir.exists()) dir.mkdirs();
+            YamlConfiguration cfg = new YamlConfiguration();
+            for (Map.Entry<UUID, List<ItemStack>> en : keptOnDeath.entrySet()) {
+                if (en.getValue() != null && !en.getValue().isEmpty()) cfg.set(en.getKey().toString(), new ArrayList<>(en.getValue()));
+            }
+            cfg.save(f);
+        } catch (Throwable t) {
+            getLogger().warning("[TempPickaxe] sauvegarde des pioches conservees KO : " + t);
+        }
+    }
+
+    private void loadKept() {
+        keptOnDeath.clear();
+        try {
+            File f = keepFile();
+            if (!f.exists()) return;
+            YamlConfiguration cfg = YamlConfiguration.loadConfiguration(f);
+            for (String key : cfg.getKeys(false)) {
+                UUID u;
+                try { u = UUID.fromString(key); } catch (IllegalArgumentException ex) { continue; }
+                List<ItemStack> items = new ArrayList<>();
+                for (Object o : cfg.getList(key, new ArrayList<>())) {
+                    if (o instanceof ItemStack is && isOurPickaxe(is)) items.add(is);
+                }
+                if (!items.isEmpty()) keptOnDeath.put(u, items);
+            }
+            if (!keptOnDeath.isEmpty()) getLogger().info("[TempPickaxe] " + keptOnDeath.size() + " joueur(s) avec une pioche a rendre au respawn.");
+        } catch (Throwable t) {
+            getLogger().warning("[TempPickaxe] lecture des pioches conservees KO : " + t);
+        }
     }
 
     // ===================== EXPIRATION =====================
