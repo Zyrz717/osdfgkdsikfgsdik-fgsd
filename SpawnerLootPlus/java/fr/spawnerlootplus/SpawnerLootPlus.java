@@ -20,8 +20,8 @@ import java.util.Map;
  * son code : tout mob absent retombe sur de la chair putrefiee. Ce plugin
  * injecte les mobs manquants dans cette table au demarrage, par reflexion.
  *
- * Il n'ecrase jamais une entree existante : les 23 mobs deja geres par
- * OptaShop gardent exactement leur loot d'origine.
+ * Les 23 mobs deja geres par OptaShop gardent leur loot d'origine, sauf
+ * IRON_GOLEM dont le loot est corrige ici (fer manquant).
  */
 public class SpawnerLootPlus extends LoadedPlugin {
 
@@ -144,6 +144,11 @@ public class SpawnerLootPlus extends LoadedPlugin {
             add(table, ctor, stringKeys, "WITHER",
                     d("COAL", 1, 3, 1.0),
                     d("NETHER_STAR", 1, 1, 0.005));
+            // Golem de fer : l'entree d'origine d'OptaShop ne donnait que le coquelicot.
+            // On l'ecrase avec le loot vanilla : 3-5 lingots de fer + 0-2 coquelicots.
+            add(table, ctor, stringKeys, "IRON_GOLEM",
+                    d("IRON_INGOT", 3, 5, 1.0),
+                    d("POPPY", 0, 2, 1.0));
 
             int added = table.size() - before;
             getLogger().info("[SpawnerLootPlus] " + added + " mobs ajoutes a la table de loot OptaShop (total " + table.size() + ").");
