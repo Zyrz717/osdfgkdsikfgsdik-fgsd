@@ -168,9 +168,11 @@ public class SellAxe extends LoadedPlugin implements Listener {
         if (!(state instanceof Container container)) return; // pas un coffre : hache normale
 
         Player p = e.getPlayer();
+        // A lire AVANT setCancelled : annuler l'event force useInteractedBlock a DENY.
+        boolean denied = (e.useInteractedBlock() == Event.Result.DENY);
         e.setCancelled(true); // on n'ouvre pas le coffre
 
-        if (e.useInteractedBlock() == Event.Result.DENY) {
+        if (denied) {
             send(p, "Tu ne peux pas vendre le contenu de ce coffre ici (zone protegee).", NamedTextColor.RED);
             return;
         }
