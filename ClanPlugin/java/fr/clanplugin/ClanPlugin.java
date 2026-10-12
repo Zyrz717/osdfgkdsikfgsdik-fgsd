@@ -16,6 +16,7 @@ import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Projectile;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
@@ -137,17 +138,36 @@ public class ClanPlugin extends LoadedPlugin implements Listener {
         return null;
     }
 
+    /** Label principal + alias : tous forces dans la command map (voir CORRECTIF ci-dessous). */
+    private static final List<String> LABELS = List.of("clan", "clans", "guilde");
+
     private void registerClanCommand() {
         CommandMap map = getCommandMap();
         if (map == null) { getLogger().warning("[ClanPlugin] CommandMap introuvable."); return; }
+        Map<String, Command> known = knownCommands(map);
+
+        // CORRECTIF : apres un rechargement du PluginLoader, seul "clan" etait remplace ;
+        // "clans" et "guilde" restaient branches sur l'ANCIENNE instance (dont le listener
+        // n'existait plus), donc /clans ouvrait un menu non protege ou on pouvait prendre
+        // les items. On retire d'abord toute ancienne entree, puis on force les 3 labels.
+        if (known != null) {
+            for (String l : LABELS) {
+                known.remove(l);
+                known.remove("clanplugin:" + l);
+            }
+        }
         Command cmd = new Command("clan", "Systeme de clans", "/clan", List.of("clans", "guilde")) {
             @Override public boolean execute(CommandSender s, String l, String[] a) { return handleCommand(s, a); }
             @Override public List<String> tabComplete(CommandSender s, String alias, String[] a) { return handleTab(s, a); }
         };
         map.register("clanplugin", cmd);
-        Map<String, Command> known = knownCommands(map);
-        if (known != null) known.put("clan", cmd);
-        myCommands.add("clan");
+        if (known != null) {
+            for (String l : LABELS) {
+                known.put(l, cmd);
+                known.put("clanplugin:" + l, cmd);
+            }
+        }
+        myCommands.addAll(LABELS);
     }
 
     private void syncCommands() {
@@ -606,15 +626,31 @@ public class ClanPlugin extends LoadedPlugin implements Listener {
 
     // ---- events GUI ----
 
-    @EventHandler
-    public void onDrag(InventoryDragEvent e) {
-        InventoryHolder h = e.getView().getTopInventory().getHolder();
-        if (h instanceof ClanMenuHolder || h instanceof MemberMenuHolder) e.setCancelled(true);
+    /** Menu de clan ouvert par une ANCIENNE instance du plugin (classes differentes apres rechargement). */
+    private boolean isStaleClanMenu(InventoryHolder h) {
+        if (h == null || h instanceof ClanMenuHolder || h instanceof MemberMenuHolder) return false;
+        String cn = h.getClass().getName();
+        return cn.endsWith("ClanPlugin$ClanMenuHolder") || cn.endsWith("ClanPlugin$MemberMenuHolder");
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onDrag(InventoryDragEvent e) {
+        InventoryHolder h = e.getView().getTopInventory().getHolder();
+        if (h instanceof ClanMenuHolder || h instanceof MemberMenuHolder || isStaleClanMenu(h)) e.setCancelled(true);
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
     public void onClick(InventoryClickEvent e) {
         InventoryHolder h = e.getView().getTopInventory().getHolder();
+        if (isStaleClanMenu(h)) {
+            // On bloque le clic et on rouvre le menu a jour.
+            e.setCancelled(true);
+            if (e.getWhoClicked() instanceof Player p) {
+                p.closeInventory();
+                Bukkit.getScheduler().runTask(getHost(), () -> p.performCommand("clan"));
+            }
+            return;
+        }
         if (!(h instanceof ClanMenuHolder) && !(h instanceof MemberMenuHolder)) return;
         e.setCancelled(true);
         if (e.getClickedInventory() == null) return;
