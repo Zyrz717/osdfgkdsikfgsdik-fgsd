@@ -27,10 +27,13 @@ import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.plugin.Plugin;
+import org.bukkit.plugin.RegisteredListener;
 
 import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -61,6 +64,7 @@ public class DailyRewards extends LoadedPlugin implements Listener {
     private static final String ITEM_OPEN = "optaland_daily:gift_open";
     private static final String ITEM_LOCK = "optaland_daily:gift_locked";
 
+    private static final String[] LABELS = {"daily", "recompense", "recompenses", "journalier"};
     private static final int[] DAY_SLOTS = {10, 11, 12, 13, 14, 15, 16};
     private static final int SLOT_INFO = 9, SLOT_CLOSE = 17;
     private static final long HOUR = 3600_000L;
@@ -94,6 +98,7 @@ public class DailyRewards extends LoadedPlugin implements Listener {
 
     @Override
     public void onEnable() {
+        unregisterStaleListeners(); // listeners fantomes d'une ancienne instance (apres /plreload)
         dataFolder = new File(getHost().getDataFolder(), "dailyrewards");
         if (!dataFolder.exists() && !dataFolder.mkdirs()) {
             getLogger().warning("[DailyRewards] impossible de creer " + dataFolder);
@@ -108,9 +113,14 @@ public class DailyRewards extends LoadedPlugin implements Listener {
         } catch (Throwable t) {
             getLogger().severe("[DailyRewards] listener impossible a enregistrer : " + t);
         }
-        for (String label : new String[]{"daily", "recompense", "recompenses", "journalier"}) {
-            registerCommand(label, this::handleCommand);
-        }
+        for (String label : LABELS) registerCommand(label, this::handleCommand);
+        // CORRECTIF : apres /plreload, le label /daily reste branche sur l'ANCIENNE instance
+        // (commandMap.register ne remplace pas un label deja pris) -> son menu n'est pas
+        // reconnu par le nouveau listener et les items sont prenables. On reprend les labels.
+        forceClaimLabels();
+        try {
+            Bukkit.getScheduler().runTaskLater((Plugin) getHost(), this::forceClaimLabels, 20L);
+        } catch (Throwable ignored) {}
         getLogger().info("[DailyRewards] actif - /daily (cooldown " + (cooldownMs / HOUR) + "h, reset " + (resetMs / HOUR) + "h, ouverture a la connexion : " + openOnJoin + ").");
     }
 
@@ -122,6 +132,71 @@ public class DailyRewards extends LoadedPlugin implements Listener {
         for (Player p : Bukkit.getOnlinePlayers()) {
             if (p.getOpenInventory().getTopInventory().getHolder() instanceof Holder) p.closeInventory();
         }
+    }
+
+    /** Retire les listeners d'une ancienne instance de cette classe (reload). */
+    private void unregisterStaleListeners() {
+        try {
+            String myClass = getClass().getName();
+            for (HandlerList hl : HandlerList.getHandlerLists()) {
+                for (RegisteredListener rl : hl.getRegisteredListeners()) {
+                    Object l = rl.getListener();
+                    if (l != null && l != this && l.getClass().getName().equals(myClass)) {
+                        try { hl.unregister(rl); } catch (Throwable ignored) {}
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    /** Branche /daily (et alias) sur NOS commandes meme si une ancienne instance les tenait. */
+    @SuppressWarnings("unchecked")
+    private void forceClaimLabels() {
+        try {
+            Object server = Bukkit.getServer();
+            Object map = server.getClass().getMethod("getCommandMap").invoke(server);
+            Method getCommand = map.getClass().getMethod("getCommand", String.class);
+            Field field = null;
+            for (Class<?> c = map.getClass(); c != null && field == null; c = c.getSuperclass()) {
+                try { field = c.getDeclaredField("knownCommands"); } catch (NoSuchFieldException ignored) {}
+            }
+            if (field == null) { getLogger().warning("[DailyRewards] knownCommands introuvable."); return; }
+            field.setAccessible(true);
+            Map<String, Object> known = (Map<String, Object>) field.get(map);
+            String prefix = getName().toLowerCase(Locale.ROOT) + ":";
+            boolean changed = false;
+            for (String label : LABELS) {
+                Object ours = getCommand.invoke(map, prefix + label);
+                if (ours == null) ours = known.get(prefix + label);
+                if (ours == null) {
+                    for (Map.Entry<String, Object> en : known.entrySet()) {
+                        if (en.getKey().endsWith(":" + label) && en.getValue() != null
+                                && en.getValue().getClass().getName().startsWith("fr.loader.api.LoadedPlugin")) {
+                            ours = en.getValue();
+                            break;
+                        }
+                    }
+                }
+                if (ours == null) continue; // le label nous appartient deja directement
+                Object current = known.get(label);
+                if (current != ours) {
+                    known.put(label, ours);
+                    changed = true;
+                    getLogger().info("[DailyRewards] /" + label + " etait pris par "
+                            + (current == null ? "personne" : current.getClass().getName()) + " -> repris.");
+                }
+            }
+            if (changed) {
+                try { server.getClass().getMethod("syncCommands").invoke(server); } catch (Throwable ignored) {}
+            }
+        } catch (Throwable t) {
+            getLogger().warning("[DailyRewards] reprise des labels impossible : " + t);
+        }
+    }
+
+    /** Menu ouvert par une ANCIENNE instance du plugin (classe differente apres rechargement). */
+    private static boolean isStaleMenu(InventoryHolder h) {
+        return h != null && !(h instanceof Holder) && h.getClass().getName().endsWith("DailyRewards$Holder");
     }
 
     // ===================== commandes =====================
@@ -302,10 +377,20 @@ public class DailyRewards extends LoadedPlugin implements Listener {
 
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onClick(InventoryClickEvent e) {
-        if (!(e.getInventory().getHolder() instanceof Holder)) return;
+        InventoryHolder h = e.getView().getTopInventory().getHolder();
+        if (isStaleMenu(h)) {
+            // menu d'une ancienne instance : on bloque et on rouvre le menu a jour
+            e.setCancelled(true);
+            if (e.getWhoClicked() instanceof Player p) {
+                p.closeInventory();
+                Bukkit.getScheduler().runTask((Plugin) getHost(), () -> open(p));
+            }
+            return;
+        }
+        if (!(h instanceof Holder)) return;
         e.setCancelled(true);
         if (!(e.getWhoClicked() instanceof Player p)) return;
-        if (e.getClickedInventory() != e.getInventory()) return; // clic dans l'inventaire du joueur
+        if (e.getClickedInventory() == null || e.getClickedInventory() != e.getView().getTopInventory()) return;
         int slot = e.getRawSlot();
         if (slot == SLOT_CLOSE) { p.closeInventory(); return; }
         for (int i = 0; i < DAY_SLOTS.length; i++) {
@@ -315,7 +400,8 @@ public class DailyRewards extends LoadedPlugin implements Listener {
 
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onDrag(InventoryDragEvent e) {
-        if (e.getInventory().getHolder() instanceof Holder) e.setCancelled(true);
+        InventoryHolder h = e.getView().getTopInventory().getHolder();
+        if (h instanceof Holder || isStaleMenu(h)) e.setCancelled(true);
     }
 
     @EventHandler
