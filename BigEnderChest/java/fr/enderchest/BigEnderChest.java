@@ -87,7 +87,63 @@ public class BigEnderChest extends LoadedPlugin implements Listener {
         registerCommand("enderchest", this::handleCommand);
         registerCommand("ec", this::handleCommand);
 
+        // CORRECTIF : EssentialsX enregistre lui aussi /enderchest et /ec (au demarrage,
+        // avant nous), donc nos deux commandes n'etaient accessibles que via
+        // /bigenderchest:ec. /ec JOUEUR tombait sur la version Essentials, qui ouvre
+        // le coffre de l'Ender VANILLA (27 slots, vide ici) -> "ca ne marche plus".
+        // On reprend les deux labels de force, 1 s apres le demarrage.
+        forceClaimLabels();
+        try {
+            Bukkit.getScheduler().runTaskLater((Plugin) getHost(), this::forceClaimLabels, 20L);
+        } catch (Throwable ignored) {}
+
         getLogger().info("BigEnderChest active.");
+    }
+
+    /** Branche /enderchest et /ec sur NOS commandes meme si un autre plugin les avait prises. */
+    @SuppressWarnings("unchecked")
+    private void forceClaimLabels() {
+        try {
+            Object server = Bukkit.getServer();
+            Object map = server.getClass().getMethod("getCommandMap").invoke(server);
+            java.lang.reflect.Method getCommand = map.getClass().getMethod("getCommand", String.class);
+            java.lang.reflect.Field field = null;
+            for (Class<?> c = map.getClass(); c != null && field == null; c = c.getSuperclass()) {
+                try { field = c.getDeclaredField("knownCommands"); } catch (NoSuchFieldException ignored) {}
+            }
+            if (field == null) { getLogger().warning("[BigEnderChest] knownCommands introuvable."); return; }
+            field.setAccessible(true);
+            Map<String, Object> known = (Map<String, Object>) field.get(map);
+            String prefix = getName().toLowerCase(java.util.Locale.ROOT) + ":";
+            boolean changed = false;
+            for (String label : new String[]{"enderchest", "ec"}) {
+                Object ours = getCommand.invoke(map, prefix + label);
+                if (ours == null) ours = known.get(prefix + label);
+                if (ours == null) {
+                    // Repli : une entree "xxx:label" dont la commande est un wrapper du PluginLoader.
+                    for (Map.Entry<String, Object> en : known.entrySet()) {
+                        if (en.getKey().endsWith(":" + label) && en.getValue() != null
+                                && en.getValue().getClass().getName().startsWith("fr.loader.api.LoadedPlugin")) {
+                            ours = en.getValue();
+                            break;
+                        }
+                    }
+                }
+                if (ours == null) { getLogger().warning("[BigEnderChest] commande " + prefix + label + " introuvable."); continue; }
+                Object current = known.get(label);
+                if (current != ours) {
+                    known.put(label, ours);
+                    changed = true;
+                    getLogger().info("[BigEnderChest] /" + label + " etait pris par "
+                            + (current == null ? "personne" : current.getClass().getName()) + " -> repris.");
+                }
+            }
+            if (changed) {
+                try { server.getClass().getMethod("syncCommands").invoke(server); } catch (Throwable ignored) {}
+            }
+        } catch (Throwable t) {
+            getLogger().warning("[BigEnderChest] reprise de /ec impossible : " + t);
+        }
     }
 
     /** Logique commune a /enderchest et /ec. */
