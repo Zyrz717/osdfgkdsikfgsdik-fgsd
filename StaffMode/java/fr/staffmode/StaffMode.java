@@ -624,8 +624,9 @@ public class StaffMode extends LoadedPlugin implements Listener {
             if (!hasUserNode(p, "grade." + g)) lpRun("user " + u + " permission set grade." + g + " true");
             lpRun("user " + u + " parent remove " + g);
         }
-        if (live != null && !containsIgnoreCase(live, "default")) lpRun("user " + u + " parent add default");
-        lpRun("user " + u + " parent switchprimarygroup default");
+        boolean addDefault = (live != null && !containsIgnoreCase(live, "default"));
+        if (addDefault) lpRun("user " + u + " parent add default");
+        if (!groups.isEmpty() || addDefault) lpRun("user " + u + " parent switchprimarygroup default");
         if (!groups.isEmpty()) {
             getLogger().info("[StaffMode] " + p.getName() + " (" + reason + ") -> groupes staff retires " + groups + ", grade Joueur.");
         }
