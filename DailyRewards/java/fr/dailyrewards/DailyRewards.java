@@ -20,6 +20,8 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerResourcePackStatusEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
@@ -31,9 +33,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -43,7 +47,7 @@ import java.util.UUID;
  *  - serie perdue (retour au jour 1) apres reset-hours sans reclamer (48h)
  *  - menu 9x3 texture ItemsAdder (optaland_daily:daily_gui) + icones cadeaux
  *  - recompenses = commandes console dans plugins/PluginLoader/dailyrewards/config.yml
- *  - rappel a la connexion si une recompense est disponible
+ *  - a la connexion : rappel + ouverture automatique du menu (open-on-join)
  *
  *  Commandes : /daily (alias /recompense /recompenses /journalier)
  *              /daily reset <joueur>   (dailyrewards.admin)
@@ -82,6 +86,9 @@ public class DailyRewards extends LoadedPlugin implements Listener {
     private long cooldownMs = 24 * HOUR;
     private long resetMs = 48 * HOUR;
     private String prefix = "";
+    private String openOnJoin = "always";      // always | available | never
+    private long openDelayTicks = 12 * 20L;    // delai max si le pack de textures tarde
+    private final Set<UUID> pendingOpen = new HashSet<>();
 
     // ===================== cycle de vie =====================
 
@@ -104,12 +111,13 @@ public class DailyRewards extends LoadedPlugin implements Listener {
         for (String label : new String[]{"daily", "recompense", "recompenses", "journalier"}) {
             registerCommand(label, this::handleCommand);
         }
-        getLogger().info("[DailyRewards] actif - /daily (cooldown " + (cooldownMs / HOUR) + "h, reset " + (resetMs / HOUR) + "h).");
+        getLogger().info("[DailyRewards] actif - /daily (cooldown " + (cooldownMs / HOUR) + "h, reset " + (resetMs / HOUR) + "h, ouverture a la connexion : " + openOnJoin + ").");
     }
 
     @Override
     public void onDisable() {
         try { HandlerList.unregisterAll(this); } catch (Throwable ignored) {}
+        pendingOpen.clear();
         savePlayers();
         for (Player p : Bukkit.getOnlinePlayers()) {
             if (p.getOpenInventory().getTopInventory().getHolder() instanceof Holder) p.closeInventory();
@@ -313,16 +321,39 @@ public class DailyRewards extends LoadedPlugin implements Listener {
     @EventHandler
     public void onJoin(PlayerJoinEvent e) {
         Player p = e.getPlayer();
-        Bukkit.getScheduler().runTaskLater((Plugin) getHost(), () -> {
-            if (!p.isOnline()) return;
-            long now = System.currentTimeMillis();
-            Data d = data(p.getUniqueId());
-            normalize(d, now);
-            if (claimable(d, now)) {
-                send(p, msg("reminder"));
-                p.playSound(p.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 0.8f, 1.4f);
-            }
-        }, 100L);
+        pendingOpen.add(p.getUniqueId());
+        // ouverture des que le pack de textures est charge (voir onPackStatus), sinon au plus tard apres le delai
+        Bukkit.getScheduler().runTaskLater((Plugin) getHost(), () -> autoOpen(p), openDelayTicks);
+    }
+
+    @EventHandler
+    public void onPackStatus(PlayerResourcePackStatusEvent e) {
+        if (e.getStatus() != PlayerResourcePackStatusEvent.Status.SUCCESSFULLY_LOADED) return;
+        Player p = e.getPlayer();
+        if (!pendingOpen.contains(p.getUniqueId())) return;
+        Bukkit.getScheduler().runTaskLater((Plugin) getHost(), () -> autoOpen(p), 20L);
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent e) {
+        pendingOpen.remove(e.getPlayer().getUniqueId());
+    }
+
+    /** Rappel + ouverture automatique (une seule fois par connexion). */
+    private void autoOpen(Player p) {
+        UUID u = p.getUniqueId();
+        if (!p.isOnline()) { pendingOpen.remove(u); return; }
+        if (!pendingOpen.remove(u)) return; // deja fait pour cette connexion
+        long now = System.currentTimeMillis();
+        Data d = data(u);
+        normalize(d, now);
+        boolean can = claimable(d, now);
+        if (can) {
+            send(p, msg("reminder"));
+            p.playSound(p.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 0.8f, 1.4f);
+        }
+        boolean doOpen = openOnJoin.equals("always") || (openOnJoin.equals("available") && can);
+        if (doOpen && !(p.getOpenInventory().getTopInventory().getHolder() instanceof Holder)) open(p);
     }
 
     // ===================== config =====================
@@ -337,6 +368,10 @@ public class DailyRewards extends LoadedPlugin implements Listener {
             "# ============================================================",
             "cooldown-hours: 24",
             "reset-hours: 48",
+            "# Ouverture automatique du menu a la connexion : always (toujours), available (seulement si une recompense est dispo), never",
+            "open-on-join: always",
+            "# Delai max (secondes) avant l'ouverture si le pack de textures n'a pas fini de charger",
+            "open-on-join-delay-seconds: 12",
             "prefix: \"&6&lR\u00c9COMPENSES &8\u00bb &7\"",
             "messages:",
             "  claimed: \"Jour {day} r\u00e9cup\u00e9r\u00e9 : {reward}&7 !\"",
@@ -393,6 +428,10 @@ public class DailyRewards extends LoadedPlugin implements Listener {
         cooldownMs = Math.max(1, (long) (config.getDouble("cooldown-hours", 24) * HOUR));
         resetMs = Math.max(cooldownMs, (long) (config.getDouble("reset-hours", 48) * HOUR));
         prefix = config.getString("prefix", "&6&lR\u00c9COMPENSES &8\u00bb &7");
+        openOnJoin = config.getString("open-on-join", "always").toLowerCase(Locale.ROOT).trim();
+        if (openOnJoin.equals("true")) openOnJoin = "always";
+        if (openOnJoin.equals("false")) openOnJoin = "never";
+        openDelayTicks = Math.max(20L, (long) (config.getDouble("open-on-join-delay-seconds", 12) * 20));
     }
 
     private String msg(String key) {
