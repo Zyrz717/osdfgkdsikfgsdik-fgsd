@@ -175,6 +175,14 @@ public class StaffMode extends LoadedPlugin implements Listener {
         // Tache d'application continue du fly.
         startFlyTask();
 
+        // Staffs hors service qui ont encore leur groupe -> Joueur (2 s apres le chargement).
+        try {
+            org.bukkit.plugin.Plugin plugin = hostPlugin();
+            if (plugin != null) Bukkit.getScheduler().runTaskLater(plugin, () -> {
+                for (Player p : Bukkit.getOnlinePlayers()) normalizeOffDuty(p);
+            }, 40L);
+        } catch (Throwable ignored) {}
+
         getLogger().info("[StaffMode] active." + (roleEnabled && !luckPermsPresent
                 ? " (role active mais LuckPerms introuvable -> gestion de role ignoree)" : ""));
     }
@@ -526,13 +534,118 @@ public class StaffMode extends LoadedPlugin implements Listener {
         return out;
     }
 
-    /** Choisit le grade staff le PLUS HAUT pour lequel le joueur a la permission grade.<nom>. */
+    /**
+     * Verification EXPLICITE via l'API LuckPerms (Tristate TRUE uniquement) : un OP sans
+     * la permission n'est PAS considere comme l'ayant (sinon tout OP recevait grade.owner).
+     * Si LuckPerms est indisponible : repli sur hasPermission, sauf pour les OP.
+     */
+    private boolean hasExplicit(Player p, String perm) {
+        try {
+            Object lp = lpApiOrNull();
+            if (lp != null) {
+                Object um = lp.getClass().getMethod("getUserManager").invoke(lp);
+                Object user = um.getClass().getMethod("getUser", UUID.class).invoke(um, p.getUniqueId());
+                if (user != null) {
+                    Object cached = user.getClass().getMethod("getCachedData").invoke(user);
+                    Object permData = cached.getClass().getMethod("getPermissionData").invoke(cached);
+                    Object tristate = permData.getClass().getMethod("checkPermission", String.class).invoke(permData, perm);
+                    return tristate != null && "TRUE".equalsIgnoreCase(tristate.toString());
+                }
+            }
+        } catch (Throwable ignored) {}
+        return !p.isOp() && p.hasPermission(perm);
+    }
+
+    /** true si le noeud est pose DIRECTEMENT sur l'utilisateur (pas herite d'un groupe). */
+    @SuppressWarnings("unchecked")
+    private boolean hasUserNode(Player p, String perm) {
+        try {
+            Object lp = lpApiOrNull();
+            if (lp == null) return false;
+            Object um = lp.getClass().getMethod("getUserManager").invoke(lp);
+            Object user = um.getClass().getMethod("getUser", UUID.class).invoke(um, p.getUniqueId());
+            if (user == null) return false;
+            Object nodes = user.getClass().getMethod("getNodes").invoke(user);
+            for (Object node : (Iterable<Object>) nodes) {
+                Object key = node.getClass().getMethod("getKey").invoke(node);
+                if (perm.equalsIgnoreCase(String.valueOf(key))) {
+                    Object val = node.getClass().getMethod("getValue").invoke(node);
+                    return Boolean.TRUE.equals(val);
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    /**
+     * Choisit le grade staff le PLUS HAUT du joueur :
+     *   1) permission explicite grade.<nom> (LuckPerms, sans repli OP) ;
+     *   2) sinon, un groupe staff possede en permanent (ancien modele) -> converti.
+     */
     private String pickStaffGrade(Player p) {
-        for (String g : effectiveGradePriority()) {
+        List<String> prio = effectiveGradePriority();
+        for (String g : prio) {
             if (g == null || g.isEmpty()) continue;
-            if (p.hasPermission("grade." + g)) return g;
+            if (hasExplicit(p, "grade." + g)) return g;
+        }
+        List<String> live = getParentGroups(p);
+        if (live != null) {
+            for (String g : prio) {
+                if (g != null && !g.isEmpty() && containsIgnoreCase(live, g)) {
+                    getLogger().info("[StaffMode] " + p.getName() + " possede le groupe '" + g
+                            + "' en permanent (ancien modele) -> converti en grade staff.");
+                    return g;
+                }
+            }
         }
         return null;
+    }
+
+    /** Groupes staff (owner/admin/mod/...) actuellement possedes par le joueur. */
+    private List<String> staffGroupsOf(Player p, List<String> live) {
+        List<String> out = new ArrayList<>();
+        if (live == null) return out;
+        for (String g : effectiveGradePriority()) {
+            if (g != null && !g.isEmpty() && containsIgnoreCase(live, g) && !containsIgnoreCase(out, g)) out.add(g);
+        }
+        return out;
+    }
+
+    /**
+     * HORS SERVICE = JOUEUR : retire TOUS les groupes staff du joueur (meme donnes en
+     * permanent via "lp user X parent add mod"), en s'assurant d'abord que la permission
+     * grade.<nom> est posee sur l'utilisateur pour qu'il puisse reprendre son grade avec /staff.
+     */
+    private List<String> stripStaffGroups(Player p, String reason) {
+        UUID u = p.getUniqueId();
+        List<String> live = getParentGroups(p);
+        List<String> groups = staffGroupsOf(p, live);
+        for (String g : groups) {
+            if (!hasUserNode(p, "grade." + g)) lpRun("user " + u + " permission set grade." + g + " true");
+            lpRun("user " + u + " parent remove " + g);
+        }
+        if (live != null && !containsIgnoreCase(live, "default")) lpRun("user " + u + " parent add default");
+        lpRun("user " + u + " parent switchprimarygroup default");
+        if (!groups.isEmpty()) {
+            getLogger().info("[StaffMode] " + p.getName() + " (" + reason + ") -> groupes staff retires " + groups + ", grade Joueur.");
+        }
+        return groups;
+    }
+
+    /**
+     * Joueur hors service qui possede encore un groupe staff (ex: donne en permanent par
+     * erreur, ou plugin recharge pendant qu'il etait en service) -> on le remet Joueur.
+     * Ne concerne que les membres du staff (permission staffmode.use.optaland ou deja passes par /staff).
+     */
+    private void normalizeOffDuty(Player p) {
+        if (!roleEnabled || !lpReady() || p == null || !p.isOnline()) return;
+        UUID u = p.getUniqueId();
+        if (staffMode.contains(u)) return;
+        if (!(hasExplicit(p, PERM) || staffMembers.contains(u))) return;
+        List<String> removed = stripStaffGroups(p, "hors service");
+        if (!removed.isEmpty()) {
+            send(p, "Hors service : grade remis sur Joueur. Fais /staff pour reprendre ton grade.", NamedTextColor.GRAY);
+        }
     }
 
     /**
@@ -551,24 +664,26 @@ public class StaffMode extends LoadedPlugin implements Listener {
             return;
         }
 
+        // La permission grade.<nom> doit etre posee sur l'UTILISATEUR : sinon elle disparait
+        // avec le groupe a la sortie et le joueur ne pourrait plus reprendre son grade.
+        if (!hasUserNode(p, "grade." + grade)) lpRun("user " + u + " permission set grade." + grade + " true");
+
         List<String> live = getParentGroups(p);
         boolean alreadyHas = (live != null && containsIgnoreCase(live, grade));
 
-        // Memoriser le grade principal actuel pour remettre l'affichage a la sortie.
+        // Memoriser le grade principal actuel (information seulement).
         String primary = getPrimaryGroup(p);
         if (primary != null && !primary.isEmpty()) previousPrimary.put(u, primary);
 
-        // Ajouter le grade staff (sauf s'il l'a deja en permanent -> on ne le retirera pas a la sortie).
-        if (!alreadyHas) {
-            lpRun("user " + u + " parent add " + grade);
-            gradeToggled.computeIfAbsent(u, k -> ConcurrentHashMap.newKeySet()).add(grade);
-        }
-        // Afficher le grade staff.
+        // Ajouter le grade staff. Il est TOUJOURS memorise : hors service, le staff est Joueur,
+        // meme si le groupe avait ete donne en permanent.
+        if (!alreadyHas) lpRun("user " + u + " parent add " + grade);
+        gradeToggled.computeIfAbsent(u, k -> ConcurrentHashMap.newKeySet()).add(grade);
         lpRun("user " + u + " parent switchprimarygroup " + grade);
 
         persist();
         getLogger().info("[StaffMode] " + p.getName() + " en service -> grade staff '" + grade + "'"
-                + (alreadyHas ? " (deja possede, non retire a la sortie)" : " (ajoute)") + ".");
+                + (alreadyHas ? " (deja possede)" : " (ajoute)") + ".");
     }
 
     /**
@@ -578,11 +693,11 @@ public class StaffMode extends LoadedPlugin implements Listener {
     private void applyRoleOnExit(Player p) {
         if (!roleEnabled || !lpReady()) return;
         UUID u = p.getUniqueId();
-        String primary = previousPrimary.remove(u);
-        if (primary != null && !primary.isEmpty()) {
-            lpRun("user " + u + " parent switchprimarygroup " + primary);
-            getLogger().info("[StaffMode] " + p.getName() + " -> affichage remis sur '" + primary + "'.");
-        }
+        previousPrimary.remove(u);
+        // Hors service = Joueur : on retire tout groupe staff encore present (meme permanent)
+        // et on remet l'affichage sur default. (primary-group-calculation: parents-by-weight
+        // -> le grade affiche est le groupe le plus lourd, donc le groupe DOIT etre retire.)
+        stripStaffGroups(p, "sortie du staff");
         persist();
     }
 
@@ -678,7 +793,7 @@ public class StaffMode extends LoadedPlugin implements Listener {
         if (a.length == 0) {
             send(p, "Grades (/grade <nom>) :", NamedTextColor.YELLOW);
             List<String> shown = new ArrayList<>();
-            for (String g : gradeList) if (p.hasPermission("grade." + g) && !containsIgnoreCase(shown, g)) shown.add(g);
+            for (String g : gradeList) if (hasExplicit(p, "grade." + g) && !containsIgnoreCase(shown, g)) shown.add(g);
             Set<String> active = gradeToggled.get(u);
             if (active != null) for (String g : active) if (!containsIgnoreCase(shown, g)) shown.add(g);
             if (shown.isEmpty()) {
@@ -696,7 +811,7 @@ public class StaffMode extends LoadedPlugin implements Listener {
         }
 
         String name = a[0].toLowerCase(Locale.ROOT);
-        if (!p.hasPermission("grade." + name)) {
+        if (!hasExplicit(p, "grade." + name)) {
             send(p, "Tu n'as pas la permission grade." + name + ".", NamedTextColor.RED);
             return true;
         }
@@ -744,7 +859,7 @@ public class StaffMode extends LoadedPlugin implements Listener {
             String x = a[0].toLowerCase(Locale.ROOT);
             List<String> out = new ArrayList<>();
             for (String g : gradeList) {
-                if (p.hasPermission("grade." + g) && g.toLowerCase(Locale.ROOT).startsWith(x) && !out.contains(g)) out.add(g);
+                if (hasExplicit(p, "grade." + g) && g.toLowerCase(Locale.ROOT).startsWith(x) && !out.contains(g)) out.add(g);
             }
             Set<String> active = gradeToggled.get(p.getUniqueId());
             if (active != null) for (String g : active) {
@@ -1026,6 +1141,11 @@ public class StaffMode extends LoadedPlugin implements Listener {
         Player p = e.getPlayer();
         if (pendingRestore.contains(p.getUniqueId())) restoreFromPending(p);
         snapshot(p, "join", true, true);
+        // Staff hors service encore avec son groupe (ex: donne en permanent) -> Joueur.
+        try {
+            org.bukkit.plugin.Plugin plugin = hostPlugin();
+            if (plugin != null) Bukkit.getScheduler().runTaskLater(plugin, () -> normalizeOffDuty(p), 40L);
+        } catch (Throwable ignored) {}
     }
 
     @EventHandler
