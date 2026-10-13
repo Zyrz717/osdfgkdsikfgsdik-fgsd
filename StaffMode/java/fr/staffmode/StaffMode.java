@@ -525,11 +525,19 @@ public class StaffMode extends LoadedPlugin implements Listener {
     private static final List<String> DEFAULT_STAFF_PRIORITY =
             List.of("owner", "super_admin", "admin", "super_modo", "mod");
 
-    /** Liste effective des grades a tester, dans l'ordre de priorite (haut -> bas). */
+    /**
+     * Liste effective des grades a tester, dans l'ordre de priorite (haut -> bas) :
+     * d'abord la liste "grades" de configstaff.yml (son ordre = la priorite, ce qui permet
+     * un grade personnalise au-dessus de owner, ex: souverain), puis les grades standard
+     * qui n'y figurent pas.
+     */
     private List<String> effectiveGradePriority() {
-        List<String> out = new ArrayList<>(DEFAULT_STAFF_PRIORITY);
+        List<String> out = new ArrayList<>();
         for (String g : gradeList) {
             if (g != null && !g.isEmpty() && !containsIgnoreCase(out, g)) out.add(g);
+        }
+        for (String g : DEFAULT_STAFF_PRIORITY) {
+            if (!containsIgnoreCase(out, g)) out.add(g);
         }
         return out;
     }
