@@ -606,7 +606,7 @@ public class TradePlugin extends LoadedPlugin implements Listener {
         InventoryHolder h = top.getHolder();
         if (isStaleMenu(h)) {
             e.setCancelled(true);
-            if (e.getWhoClicked() instanceof Player p) Bukkit.getScheduler().runTask((Plugin) getHost(), p::closeInventory);
+            if (e.getWhoClicked() instanceof Player p) Bukkit.getScheduler().runTask((Plugin) getHost(), () -> p.closeInventory());
             return;
         }
         if (!(h instanceof Holder holder)) return;
