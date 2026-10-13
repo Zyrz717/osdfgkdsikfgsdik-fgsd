@@ -95,6 +95,9 @@ public class ShopUI extends LoadedPlugin implements Listener {
 
     @Override
     public void onEnable() {
+        // Desactive : les joueurs pouvaient retirer les items du menu texture.
+        // /shop utilise desormais le menu natif de OptaShop.
+        if (true) return;
         try {
             Bukkit.getPluginManager().registerEvents(this, getHost());
         } catch (Throwable t) {
