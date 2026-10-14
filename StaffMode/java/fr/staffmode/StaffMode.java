@@ -625,10 +625,13 @@ public class StaffMode extends LoadedPlugin implements Listener {
             if (g == null || g.isEmpty()) continue;
             if (hasExactNode(p, "grade." + g)) return g;   // noeud exact : le joker "*" ne compte pas
         }
+        // Migration de l'ancien modele (groupe staff donne en permanent) : UNIQUEMENT pour les
+        // grades standard. Un grade personnalise (ex: souverain) n'est jamais deduit d'un groupe,
+        // il faut la permission grade.<nom> explicite sur le joueur.
         List<String> live = getParentGroups(p);
         if (live != null) {
-            for (String g : prio) {
-                if (g != null && !g.isEmpty() && containsIgnoreCase(live, g)) {
+            for (String g : DEFAULT_STAFF_PRIORITY) {
+                if (containsIgnoreCase(live, g)) {
                     getLogger().info("[StaffMode] " + p.getName() + " possede le groupe '" + g
                             + "' en permanent (ancien modele) -> converti en grade staff.");
                     return g;
