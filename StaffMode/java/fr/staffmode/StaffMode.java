@@ -564,6 +564,35 @@ public class StaffMode extends LoadedPlugin implements Listener {
         return !p.isOp() && p.hasPermission(perm);
     }
 
+    /**
+     * true si le joueur possede le noeud EXACT (sur lui ou herite d'un de ses groupes),
+     * sans tenir compte des jokers : un joueur qui a "*" n'a pas pour autant tous les
+     * grade.<x> (sinon il recevait toujours le grade le plus haut de la liste).
+     */
+    @SuppressWarnings("unchecked")
+    private boolean hasExactNode(Player p, String perm) {
+        try {
+            Object lp = lpApiOrNull();
+            if (lp == null) return false;
+            Object um = lp.getClass().getMethod("getUserManager").invoke(lp);
+            Object user = um.getClass().getMethod("getUser", UUID.class).invoke(um, p.getUniqueId());
+            if (user == null) return false;
+            Object qo = user.getClass().getMethod("getQueryOptions").invoke(user);
+            Class<?> qoClass = Class.forName("net.luckperms.api.query.QueryOptions", true, lpClassLoader());
+            Object nodes = user.getClass().getMethod("resolveInheritedNodes", qoClass).invoke(user, qo);
+            for (Object node : (Iterable<Object>) nodes) {
+                Object key = node.getClass().getMethod("getKey").invoke(node);
+                if (perm.equalsIgnoreCase(String.valueOf(key))) {
+                    Object val = node.getClass().getMethod("getValue").invoke(node);
+                    return Boolean.TRUE.equals(val);
+                }
+            }
+            return false;
+        } catch (Throwable t) {
+            return hasUserNode(p, perm);
+        }
+    }
+
     /** true si le noeud est pose DIRECTEMENT sur l'utilisateur (pas herite d'un groupe). */
     @SuppressWarnings("unchecked")
     private boolean hasUserNode(Player p, String perm) {
@@ -594,7 +623,7 @@ public class StaffMode extends LoadedPlugin implements Listener {
         List<String> prio = effectiveGradePriority();
         for (String g : prio) {
             if (g == null || g.isEmpty()) continue;
-            if (hasExplicit(p, "grade." + g)) return g;
+            if (hasExactNode(p, "grade." + g)) return g;   // noeud exact : le joker "*" ne compte pas
         }
         List<String> live = getParentGroups(p);
         if (live != null) {
@@ -802,7 +831,7 @@ public class StaffMode extends LoadedPlugin implements Listener {
         if (a.length == 0) {
             send(p, "Grades (/grade <nom>) :", NamedTextColor.YELLOW);
             List<String> shown = new ArrayList<>();
-            for (String g : gradeList) if (hasExplicit(p, "grade." + g) && !containsIgnoreCase(shown, g)) shown.add(g);
+            for (String g : gradeList) if (hasExactNode(p, "grade." + g) && !containsIgnoreCase(shown, g)) shown.add(g);
             Set<String> active = gradeToggled.get(u);
             if (active != null) for (String g : active) if (!containsIgnoreCase(shown, g)) shown.add(g);
             if (shown.isEmpty()) {
@@ -820,7 +849,7 @@ public class StaffMode extends LoadedPlugin implements Listener {
         }
 
         String name = a[0].toLowerCase(Locale.ROOT);
-        if (!hasExplicit(p, "grade." + name)) {
+        if (!hasExactNode(p, "grade." + name)) {
             send(p, "Tu n'as pas la permission grade." + name + ".", NamedTextColor.RED);
             return true;
         }
@@ -868,7 +897,7 @@ public class StaffMode extends LoadedPlugin implements Listener {
             String x = a[0].toLowerCase(Locale.ROOT);
             List<String> out = new ArrayList<>();
             for (String g : gradeList) {
-                if (hasExplicit(p, "grade." + g) && g.toLowerCase(Locale.ROOT).startsWith(x) && !out.contains(g)) out.add(g);
+                if (hasExactNode(p, "grade." + g) && g.toLowerCase(Locale.ROOT).startsWith(x) && !out.contains(g)) out.add(g);
             }
             Set<String> active = gradeToggled.get(p.getUniqueId());
             if (active != null) for (String g : active) {
