@@ -936,6 +936,14 @@ public class StaffMode extends LoadedPlugin implements Listener {
     }
 
     private void syncCommands() {
+        // CORRECTIF : sur Paper 1.21 les commandes tapees par les joueurs passent par l'arbre
+        // Brigadier, reconstruit uniquement par CraftServer#syncCommands(). Sans cet appel,
+        // apres /plreload le client executait encore la commande de l'ANCIENNE instance
+        // (dont l'etat etait vide) pendant quelques secondes -> /staff "fantome".
+        try {
+            Object server = Bukkit.getServer();
+            server.getClass().getMethod("syncCommands").invoke(server);
+        } catch (Throwable ignored) {}
         for (Player p : Bukkit.getOnlinePlayers()) {
             try { p.updateCommands(); } catch (Throwable ignored) {}
         }
