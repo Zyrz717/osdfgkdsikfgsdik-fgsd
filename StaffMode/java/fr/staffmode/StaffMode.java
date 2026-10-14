@@ -958,7 +958,10 @@ public class StaffMode extends LoadedPlugin implements Listener {
 
     boolean isStaff(CommandSender s) {
         if (s.hasPermission(PERM)) return true;
-        if (s instanceof Player p) return staffMembers.contains(p.getUniqueId());
+        // CORRECTIF : avant, quiconque etait passe une fois par /staff restait "staff" pour
+        // toujours (liste staffMembers). Desormais seul un joueur EN SERVICE garde l'acces
+        // sans la permission (pour pouvoir sortir), les autres doivent avoir staffmode.use.optaland.
+        if (s instanceof Player p) return staffMode.contains(p.getUniqueId());
         return false;
     }
 
