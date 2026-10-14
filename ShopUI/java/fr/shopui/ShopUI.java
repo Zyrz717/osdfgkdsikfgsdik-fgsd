@@ -95,9 +95,11 @@ public class ShopUI extends LoadedPlugin implements Listener {
 
     @Override
     public void onEnable() {
-        // Desactive : les joueurs pouvaient retirer les items du menu texture.
-        // /shop utilise desormais le menu natif de OptaShop.
-        if (true) return;
+        // CORRECTIF "items prenables" : apres /plreload, un menu ouvert par l'ANCIENNE instance
+        // (classe differente) n'etait plus reconnu par le nouveau listener -> clics non annules.
+        // Desormais : listeners fantomes retires, label /shopui repris, et tout menu d'une
+        // ancienne instance est bloque puis rouvert a jour (isStaleMenu).
+        unregisterStaleListeners();
         try {
             Bukkit.getPluginManager().registerEvents(this, getHost());
         } catch (Throwable t) {
@@ -108,6 +110,8 @@ public class ShopUI extends LoadedPlugin implements Listener {
             openMain(p);
             return true;
         });
+        forceClaimLabels();
+        try { Bukkit.getScheduler().runTaskLater(getHost(), this::forceClaimLabels, 20L); } catch (Throwable ignored) {}
         getLogger().info("[ShopUI] actif - /shop ouvre le menu texture.");
     }
 
@@ -197,7 +201,24 @@ public class ShopUI extends LoadedPlugin implements Listener {
         p.openInventory(inv);
     }
 
-    @EventHandler
+    /** Menu ouvert par une ANCIENNE instance du plugin (classes differentes apres rechargement). */
+    private static boolean isStaleMenu(InventoryHolder h) {
+        if (h == null || h instanceof Holder || h instanceof SectionHolder) return false;
+        String cn = h.getClass().getName();
+        return cn.endsWith("ShopUI$Holder") || cn.endsWith("ShopUI$SectionHolder");
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onStaleClick(InventoryClickEvent e) {
+        InventoryHolder h = e.getView().getTopInventory().getHolder();
+        if (!isStaleMenu(h)) return;
+        e.setCancelled(true);
+        if (e.getWhoClicked() instanceof Player p) {
+            Bukkit.getScheduler().runTask(getHost(), () -> { p.closeInventory(); openMain(p); });
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
     public void onClick(InventoryClickEvent e) {
         if (!(e.getView().getTopInventory().getHolder() instanceof Holder holder)) return;
         e.setCancelled(true);
@@ -278,7 +299,7 @@ public class ShopUI extends LoadedPlugin implements Listener {
         p.openInventory(inv);
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.HIGHEST)
     public void onSectionClick(InventoryClickEvent e) {
         if (!(e.getView().getTopInventory().getHolder() instanceof SectionHolder holder)) return;
         e.setCancelled(true);
@@ -353,10 +374,64 @@ public class ShopUI extends LoadedPlugin implements Listener {
         return it;
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.HIGHEST)
     public void onDrag(InventoryDragEvent e) {
         InventoryHolder h = e.getView().getTopInventory().getHolder();
-        if (h instanceof Holder || h instanceof SectionHolder) e.setCancelled(true);
+        if (h instanceof Holder || h instanceof SectionHolder || isStaleMenu(h)) e.setCancelled(true);
+    }
+
+    // ===================== rechargement a chaud =====================
+
+    private void unregisterStaleListeners() {
+        try {
+            String myClass = getClass().getName();
+            for (HandlerList hl : HandlerList.getHandlerLists()) {
+                for (org.bukkit.plugin.RegisteredListener rl : hl.getRegisteredListeners()) {
+                    Object l = rl.getListener();
+                    if (l != null && l != this && l.getClass().getName().equals(myClass)) {
+                        try { hl.unregister(rl); } catch (Throwable ignored) {}
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    @SuppressWarnings("unchecked")
+    private void forceClaimLabels() {
+        try {
+            Object server = Bukkit.getServer();
+            Object map = server.getClass().getMethod("getCommandMap").invoke(server);
+            Method getCommand = map.getClass().getMethod("getCommand", String.class);
+            Field field = null;
+            for (Class<?> c = map.getClass(); c != null && field == null; c = c.getSuperclass()) {
+                try { field = c.getDeclaredField("knownCommands"); } catch (NoSuchFieldException ignored) {}
+            }
+            if (field == null) return;
+            field.setAccessible(true);
+            Map<String, Object> known = (Map<String, Object>) field.get(map);
+            String pfx = getName().toLowerCase(Locale.ROOT) + ":";
+            boolean changed = false;
+            for (String label : new String[]{"shopui"}) {
+                Object ours = getCommand.invoke(map, pfx + label);
+                if (ours == null) ours = known.get(pfx + label);
+                if (ours == null) {
+                    for (Map.Entry<String, Object> en : known.entrySet()) {
+                        if (en.getKey().endsWith(":" + label) && en.getValue() != null
+                                && en.getValue().getClass().getName().startsWith("fr.loader.api.LoadedPlugin")) { ours = en.getValue(); break; }
+                    }
+                }
+                if (ours == null) continue;
+                Object current = known.get(label);
+                if (current != ours) {
+                    known.put(label, ours);
+                    changed = true;
+                    getLogger().info("[ShopUI] /" + label + " etait pris par " + (current == null ? "personne" : current.getClass().getName()) + " -> repris.");
+                }
+            }
+            if (changed) { try { server.getClass().getMethod("syncCommands").invoke(server); } catch (Throwable ignored) {} }
+        } catch (Throwable t) {
+            getLogger().warning("[ShopUI] reprise du label impossible : " + t);
+        }
     }
 
     // ===================== OptaShop (reflexion) =====================
