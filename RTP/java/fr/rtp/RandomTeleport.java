@@ -14,6 +14,7 @@ import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
@@ -21,6 +22,7 @@ import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.plugin.RegisteredListener;
 import org.bukkit.scheduler.BukkitRunnable;
 
 import java.lang.reflect.Field;
@@ -80,6 +82,8 @@ public class RandomTeleport extends LoadedPlugin {
 
     // ------------------------------------------------------------------ setup
 
+    private MenuListener menuListener;
+
     @Override
     public void onEnable() {
         // 1) La commande D'ABORD : si l'enregistrement des events echoue,
@@ -101,8 +105,12 @@ public class RandomTeleport extends LoadedPlugin {
         getLogger().info("[RTP] Commande /rtp enregistree.");
 
         // 2) Les events ensuite, isoles : une erreur ici ne casse plus la commande.
+        //    CORRECTIF : on retire d'abord les listeners d'anciennes instances (apres /plreload
+        //    leurs classes n'existent plus -> NoClassDefFoundError a chaque clic d'inventaire).
+        unregisterStaleListeners();
         try {
-            Bukkit.getPluginManager().registerEvents(new MenuListener(), getHost());
+            menuListener = new MenuListener();
+            Bukkit.getPluginManager().registerEvents(menuListener, getHost());
             getLogger().info("[RTP] Listener du menu enregistre.");
         } catch (Throwable t) {
             getLogger().severe("[RTP] Impossible d'enregistrer le listener : " + t);
@@ -166,8 +174,26 @@ public class RandomTeleport extends LoadedPlugin {
         }
     }
 
+    /** Retire les listeners fr.rtp.* d'instances precedentes (rechargement a chaud). */
+    private void unregisterStaleListeners() {
+        try {
+            for (HandlerList hl : HandlerList.getHandlerLists()) {
+                for (RegisteredListener rl : hl.getRegisteredListeners()) {
+                    Object l = rl.getListener();
+                    if (l != null && l != menuListener && l.getClass().getName().startsWith("fr.rtp.")) {
+                        try { hl.unregister(rl); } catch (Throwable ignored) {}
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
     @Override
     public void onDisable() {
+        if (menuListener != null) {
+            try { HandlerList.unregisterAll(menuListener); } catch (Throwable ignored) {}
+            menuListener = null;
+        }
         // Ferme les menus encore ouverts pour eviter les items fantomes.
         for (Player p : Bukkit.getOnlinePlayers()) {
             if (p.getOpenInventory().getTopInventory().getHolder() instanceof RtpMenu) {
