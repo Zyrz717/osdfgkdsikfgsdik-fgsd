@@ -140,10 +140,9 @@ public class SpawnerLootPlus extends LoadedPlugin {
                     d("DRAGON_BREATH", 1, 3, 1.0),
                     d("END_STONE", 2, 6, 0.60),
                     d("DRAGON_EGG", 0, 1, 0.01));
-            // Spawner Wither (crate Spawner) : charbon garanti + etoile du Nether rare.
+            // Spawner Wither (crate Spawner) : uniquement 1 etoile du Nether a chaque fois.
             add(table, ctor, stringKeys, "WITHER",
-                    d("COAL", 1, 3, 1.0),
-                    d("NETHER_STAR", 1, 1, 0.005));
+                    d("NETHER_STAR", 1, 1, 1.0));
             // Golem de fer : l'entree d'origine d'OptaShop ne donnait que le coquelicot.
             // On l'ecrase avec le loot vanilla : 3-5 lingots de fer + 0-2 coquelicots.
             add(table, ctor, stringKeys, "IRON_GOLEM",
