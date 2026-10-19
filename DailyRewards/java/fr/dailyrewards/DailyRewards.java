@@ -249,6 +249,12 @@ public class DailyRewards extends LoadedPlugin implements Listener {
     /** Applique la perte de serie / fin de cycle. Retourne true si la serie vient d'etre perdue. */
     private boolean normalize(Data d, long now) {
         boolean lost = false;
+        // migration ancienne serie de 7 jours : un joueur qui avait fini les 7 jours
+        // continue au jour suivant (8, 15...) au lieu de voir toute la serie terminee
+        if (d.cycleDone && d.total > 0 && d.total < maxDays) {
+            d.day = d.total + 1;
+            d.cycleDone = false;
+        }
         if (d.last > 0 && now - d.last >= resetMs && (d.day > 1 || d.cycleDone)) {
             lost = d.day > 1;          // un cycle termine qui expire n'est pas une "perte"
             d.day = 1;
@@ -654,7 +660,7 @@ public class DailyRewards extends LoadedPlugin implements Listener {
     /** Item ItemsAdder (namespace:id), repli : item vanilla. */
     /** premier jour (-1) de la page de 7 affichee : la semaine du prochain jour a reclamer */
     private int pageBase(Data d) {
-        int idx = d.cycleDone ? maxDays - 1 : Math.min(maxDays, Math.max(1, d.day)) - 1;
+        int idx = d.cycleDone ? 0 : Math.min(maxDays, Math.max(1, d.day)) - 1;
         return (idx / DAY_SLOTS.length) * DAY_SLOTS.length;
     }
 
