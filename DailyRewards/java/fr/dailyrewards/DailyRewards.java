@@ -46,7 +46,7 @@ import java.util.UUID;
 /**
  * DailyRewards - recompenses de connexion (/daily).
  *
- *  - 7 jours de recompenses, 1 recompense toutes les 24h (cooldown-hours)
+ *  - 32 jours de recompenses (config: days), affiches par semaine de 7, 1 recompense toutes les 24h (cooldown-hours)
  *  - serie perdue (retour au jour 1) apres reset-hours sans reclamer (48h)
  *  - menu 9x3 texture ItemsAdder (optaland_daily:daily_gui) + icones cadeaux
  *  - recompenses = commandes console dans plugins/PluginLoader/dailyrewards/config.yml
@@ -58,7 +58,7 @@ import java.util.UUID;
  */
 public class DailyRewards extends LoadedPlugin implements Listener {
 
-    private static final String FONT_IMAGE = "optaland_daily:daily_gui";
+    private static final String FONT_IMAGE = "optaland_daily:daily_gui32";
     private static final int TITLE_OFFSET = -8; // le titre commence a x=8 dans la GUI
     private static final String ITEM_GIFT = "optaland_daily:gift";
     private static final String ITEM_OPEN = "optaland_daily:gift_open";
@@ -87,6 +87,7 @@ public class DailyRewards extends LoadedPlugin implements Listener {
     private final Map<String, ItemStack> iaItems = new HashMap<>();
     private String cachedTitle;
 
+    private int maxDays = 32;          // nombre de jours de la serie (config: days)
     private long cooldownMs = 24 * HOUR;
     private long resetMs = 48 * HOUR;
     private String prefix = "";
@@ -291,11 +292,11 @@ public class DailyRewards extends LoadedPlugin implements Listener {
         }
         d.last = now;
         d.total++;
-        if (day >= 7) { d.day = 1; d.cycleDone = true; } else { d.day = day + 1; }
+        if (day >= maxDays) { d.day = 1; d.cycleDone = true; } else { d.day = day + 1; }
         savePlayers();
 
         send(p, msg("claimed").replace("{day}", String.valueOf(day)).replace("{reward}", rewardName(day)));
-        if (day >= 7) send(p, msg("cycle"));
+        if (day >= maxDays) send(p, msg("cycle"));
         p.playSound(p.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 1f, 1.2f);
         getLogger().info("[DailyRewards] " + p.getName() + " a recupere le jour " + day + " (" + stripColors(rewardName(day)) + ").");
         open(p);
@@ -314,7 +315,10 @@ public class DailyRewards extends LoadedPlugin implements Listener {
         Inventory inv = Bukkit.createInventory(h, 27, titleComponent());
         h.inv = inv;
 
-        for (int day = 1; day <= 7; day++) {
+        int base = pageBase(d);
+        for (int k = 1; k <= DAY_SLOTS.length; k++) {
+            int day = base + k;
+            if (day > maxDays) break;
             List<Component> lore = new ArrayList<>();
             lore.add(legacy("&7R\u00e9compense : " + rewardName(day)));
             lore.add(Component.empty());
@@ -346,16 +350,18 @@ public class DailyRewards extends LoadedPlugin implements Listener {
                 try { m.setEnchantmentGlintOverride(true); } catch (Throwable ignored) {}
             }
             it.setItemMeta(m);
-            inv.setItem(DAY_SLOTS[day - 1], it);
+            it.setAmount(Math.max(1, Math.min(64, day)));
+            inv.setItem(DAY_SLOTS[k - 1], it);
         }
 
         // info
-        int done = d.cycleDone ? 7 : d.day - 1;
+        int done = d.cycleDone ? maxDays : d.day - 1;
         ItemStack info = new ItemStack(Material.CLOCK);
         ItemMeta im = info.getItemMeta();
         im.displayName(legacy("&6&lTa s\u00e9rie"));
         List<Component> il = new ArrayList<>();
-        il.add(legacy("&7Progression : &e" + done + "&7/&e7"));
+        il.add(legacy("&7Progression : &e" + done + "&7/&e" + maxDays));
+        il.add(legacy("&7Semaine : &e" + (pageBase(d) / DAY_SLOTS.length + 1) + "&7/&e" + ((maxDays + DAY_SLOTS.length - 1) / DAY_SLOTS.length)));
         il.add(legacy("&7R\u00e9compenses r\u00e9cup\u00e9r\u00e9es : &e" + d.total));
         il.add(legacy("&7Prochaine : " + (can ? "&aMaintenant !" : "&e" + remaining)));
         il.add(Component.empty());
@@ -394,7 +400,7 @@ public class DailyRewards extends LoadedPlugin implements Listener {
         int slot = e.getRawSlot();
         if (slot == SLOT_CLOSE) { p.closeInventory(); return; }
         for (int i = 0; i < DAY_SLOTS.length; i++) {
-            if (DAY_SLOTS[i] == slot) { tryClaim(p, i + 1); return; }
+            if (DAY_SLOTS[i] == slot) { tryClaim(p, pageBase(data(p.getUniqueId())) + i + 1); return; }
         }
     }
 
@@ -511,6 +517,7 @@ public class DailyRewards extends LoadedPlugin implements Listener {
             config = new YamlConfiguration();
             try { config.loadFromString(DEFAULT_CONFIG); } catch (Throwable ignored) {}
         }
+        maxDays = Math.max(1, config.getInt("days", 32));
         cooldownMs = Math.max(1, (long) (config.getDouble("cooldown-hours", 24) * HOUR));
         resetMs = Math.max(cooldownMs, (long) (config.getDouble("reset-hours", 48) * HOUR));
         prefix = config.getString("prefix", "&6&lR\u00c9COMPENSES &8\u00bb &7");
@@ -645,6 +652,12 @@ public class DailyRewards extends LoadedPlugin implements Listener {
     }
 
     /** Item ItemsAdder (namespace:id), repli : item vanilla. */
+    /** premier jour (-1) de la page de 7 affichee : la semaine du prochain jour a reclamer */
+    private int pageBase(Data d) {
+        int idx = d.cycleDone ? maxDays - 1 : Math.min(maxDays, Math.max(1, d.day)) - 1;
+        return (idx / DAY_SLOTS.length) * DAY_SLOTS.length;
+    }
+
     private ItemStack iaItem(String id, Material fallback) {
         ItemStack cached = iaItems.get(id);
         if (cached == null) {
