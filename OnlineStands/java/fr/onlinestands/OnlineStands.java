@@ -55,6 +55,10 @@ import java.util.UUID;
  *
  * Verification toutes les 2 secondes ; les textes ne sont reecrits que
  * quand quelque chose change (ou chaque minute pour la duree).
+ *
+ * Ancrage : les armor stands sont verrouilles (gravite coupee, deplacement bloque)
+ * et remis a leur position enregistree s'ils ont bouge (courant d'eau, piston,
+ * explosion...). Le texte "Libre"/pseudo suit la position enregistree.
  */
 public class OnlineStands extends LoadedPlugin {
 
@@ -147,6 +151,8 @@ public class OnlineStands extends LoadedPlugin {
                 return;
             }
             unbind(stand.getUniqueId().toString());
+            try { stand.setGravity(false); } catch (Throwable ignored) { }
+            try { stand.setCanMove(false); } catch (Throwable ignored) { }
             Location l = stand.getLocation();
             Map<String, Object> entry = new LinkedHashMap<String, Object>();
             entry.put("stand", stand.getUniqueId().toString());
@@ -386,6 +392,9 @@ public class OnlineStands extends LoadedPlugin {
         if (list.isEmpty()) {
             return;
         }
+        if (anchorStands(list)) {
+            lastSignature = ""; // un stand a ete replace : on repositionne aussi les textes
+        }
         List<Player> online = onlineSorted();
         StringBuilder sig = new StringBuilder();
         for (Player p : online) {
@@ -410,6 +419,61 @@ public class OnlineStands extends LoadedPlugin {
             writeSlots(list);
             save();
         }
+    }
+
+    /** Position enregistree du slot (null si incomplete / monde absent). */
+    private Location savedLocation(Map<String, Object> e) {
+        Object w = e.get("world");
+        World world = w == null ? null : Bukkit.getWorld(String.valueOf(w));
+        if (world == null || !(e.get("x") instanceof Number) || !(e.get("z") instanceof Number)) {
+            return null;
+        }
+        return new Location(world, toDouble(e.get("x")), toDouble(e.get("y")), toDouble(e.get("z")));
+    }
+
+    /**
+     * Verrouille les armor stands et remet a sa place tout stand qui a bouge.
+     * Renvoie true si au moins un stand a ete replace.
+     */
+    private boolean anchorStands(List<Map<String, Object>> list) {
+        boolean moved = false;
+        for (Map<String, Object> e : list) {
+            Entity ent;
+            try {
+                ent = Bukkit.getEntity(UUID.fromString(String.valueOf(e.get("stand"))));
+            } catch (Throwable t) {
+                continue;
+            }
+            if (!(ent instanceof ArmorStand)) {
+                continue;
+            }
+            ArmorStand stand = (ArmorStand) ent;
+            try {
+                if (stand.hasGravity()) {
+                    stand.setGravity(false);
+                }
+            } catch (Throwable ignored) {
+            }
+            try {
+                if (stand.canMove()) {
+                    stand.setCanMove(false);
+                }
+            } catch (Throwable ignored) {
+            }
+            Location home = savedLocation(e);
+            if (home == null) {
+                continue;
+            }
+            Location now = stand.getLocation();
+            if (!now.getWorld().equals(home.getWorld()) || now.distanceSquared(home) > 0.0025) {
+                home.setYaw(now.getYaw());
+                home.setPitch(now.getPitch());
+                stand.setVelocity(new org.bukkit.util.Vector(0, 0, 0));
+                stand.teleport(home);
+                moved = true;
+            }
+        }
+        return moved;
     }
 
     /** Renvoie true si l'entree a ete modifiee (nouveau display cree). */
@@ -437,7 +501,9 @@ public class OnlineStands extends LoadedPlugin {
             }
         }
         boolean created = false;
-        Location target = stand.getLocation().clone().add(0.0, stand.isSmall() ? TEXT_HEIGHT_SMALL : TEXT_HEIGHT_NORMAL, 0.0);
+        Location home = savedLocation(e);
+        Location base = home != null ? home : stand.getLocation().clone();
+        Location target = base.add(0.0, stand.isSmall() ? TEXT_HEIGHT_SMALL : TEXT_HEIGHT_NORMAL, 0.0);
         if (td == null) {
             td = spawnDisplay(target, slot);
             e.put("display", td.getUniqueId().toString());
