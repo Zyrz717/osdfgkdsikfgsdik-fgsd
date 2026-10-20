@@ -30,10 +30,18 @@ import org.bukkit.permissions.PermissionDefault;
 import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
 
 /**
  * VillagerCapture - Optaland
@@ -54,6 +62,16 @@ import java.util.Locale;
  * le comportement vanilla de l'oeuf et recree l'entite serialisee.
  * Les appels Paper passent par reflexion pour ne jamais casser la compilation
  * si la signature change d'une version a l'autre.
+ *
+ * CORRECTIF "Pose impossible" : un villageois marque non persistant par un autre
+ * plugin etait serialise VIDE par Paper (pas d'id d'entite) -> l'oeuf ne pouvait
+ * plus etre pose ("Skipping Entity with id"). Desormais :
+ *   - a la capture, le villageois est rendu persistant avant la serialisation, et
+ *     la capture est refusee si les donnees sont incompletes (le villageois reste) ;
+ *   - l'oeuf stocke aussi metier / niveau / biome / nom en clair ;
+ *   - a la pose, un id manquant est reconstitue ; si les donnees sont vides
+ *     (anciens oeufs casses), un villageois du meme metier/niveau/nom est recree
+ *     (ses anciens echanges sont alors perdus).
  */
 public class VillagerCapture extends LoadedPlugin implements Listener {
 
@@ -61,11 +79,16 @@ public class VillagerCapture extends LoadedPlugin implements Listener {
 
     private NamespacedKey keyData;
     private NamespacedKey keyMarker;
+    private NamespacedKey keyProf, keyLevel, keyType, keyName;
 
     @Override
     public void onEnable() {
         keyData = new NamespacedKey("villagercapture", "entity");
         keyMarker = new NamespacedKey("villagercapture", "captured");
+        keyProf = new NamespacedKey("villagercapture", "profession");
+        keyLevel = new NamespacedKey("villagercapture", "level");
+        keyType = new NamespacedKey("villagercapture", "vtype");
+        keyName = new NamespacedKey("villagercapture", "name");
 
         try {
             if (Bukkit.getPluginManager().getPermission(PERM) == null) {
@@ -106,16 +129,28 @@ public class VillagerCapture extends LoadedPlugin implements Listener {
         }
         if (villager.isDead() || !villager.isValid()) return;
 
+        // Un villageois non persistant (marque par un autre plugin) serait serialise VIDE.
+        try {
+            if (!villager.isPersistent()) {
+                getLogger().info("[VillagerCapture] villageois non persistant capture par " + p.getName()
+                        + " -> rendu persistant avant la sauvegarde.");
+                villager.setPersistent(true);
+            }
+        } catch (Throwable ignored) {}
+
         byte[] data;
         try {
             data = serialize(villager);
         } catch (Throwable t) {
-            getLogger().warning("[VillagerCapture] serialisation impossible : " + t);
+            getLogger().warning("[VillagerCapture] serialisation impossible : " + rootCause(t));
             send(p, "Capture impossible, previens un admin.", NamedTextColor.RED);
             return;
         }
-        if (data == null || data.length == 0) {
-            send(p, "Capture impossible, previens un admin.", NamedTextColor.RED);
+        boolean complete = false;
+        try { complete = data != null && data.length > 0 && entityIdOf(data) != null; } catch (Throwable ignored) {}
+        if (!complete) {
+            getLogger().warning("[VillagerCapture] donnees de " + p.getName() + " incompletes (pas d'id d'entite) -> capture annulee.");
+            send(p, "Ce villageois ne peut pas etre capture.", NamedTextColor.RED);
             return;
         }
 
@@ -177,13 +212,30 @@ public class VillagerCapture extends LoadedPlugin implements Listener {
             return;
         }
 
-        Entity ent;
+        // Oeufs crees avant le correctif : l'id d'entite peut manquer dans les donnees.
+        byte[] fixed = data;
+        boolean hasPayload = false;
         try {
-            ent = deserializeAndSpawn(data, loc);
+            hasPayload = payloadEntries(data) > 0;
+            if (entityIdOf(data) == null && hasPayload) fixed = withEntityId(data, "minecraft:villager");
         } catch (Throwable t) {
-            getLogger().warning("[VillagerCapture] pose impossible : " + t);
-            send(p, "Pose impossible, previens un admin.", NamedTextColor.RED);
-            return;
+            getLogger().warning("[VillagerCapture] lecture des donnees de l'oeuf impossible : " + t);
+        }
+
+        Entity ent = null;
+        if (hasPayload) {
+            try {
+                ent = deserializeAndSpawn(fixed, loc);
+            } catch (Throwable t) {
+                getLogger().warning("[VillagerCapture] pose depuis les donnees impossible : " + rootCause(t));
+            }
+        }
+        boolean fallback = false;
+        if (ent == null) {
+            // Donnees vides ou illisibles : on recree un villageois avec les infos en clair.
+            ent = spawnFallback(item.getItemMeta(), loc);
+            fallback = ent != null;
+            if (fallback) getLogger().info("[VillagerCapture] " + p.getName() + " : oeuf sans donnees completes, villageois recree a partir du metier/niveau.");
         }
         if (ent == null) {
             send(p, "Pose impossible, previens un admin.", NamedTextColor.RED);
@@ -198,7 +250,11 @@ public class VillagerCapture extends LoadedPlugin implements Listener {
         try {
             p.playSound(loc, Sound.ENTITY_VILLAGER_CELEBRATE, 1f, 1f);
         } catch (Throwable ignored) {}
-        send(p, "Villageois repose.", NamedTextColor.GREEN);
+        if (fallback) {
+            send(p, "Villageois repose. Ses anciens echanges n'ont pas pu etre recuperes (oeuf cree avant une correction).", NamedTextColor.YELLOW);
+        } else {
+            send(p, "Villageois repose.", NamedTextColor.GREEN);
+        }
     }
 
     // ===================== ITEM =====================
@@ -233,6 +289,12 @@ public class VillagerCapture extends LoadedPlugin implements Listener {
         PersistentDataContainer pdc = meta.getPersistentDataContainer();
         pdc.set(keyMarker, PersistentDataType.BYTE, (byte) 1);
         pdc.set(keyData, PersistentDataType.BYTE_ARRAY, data);
+        try { pdc.set(keyProf, PersistentDataType.STRING, ((org.bukkit.Keyed) v.getProfession()).getKey().getKey()); } catch (Throwable ignored) {}
+        try { pdc.set(keyType, PersistentDataType.STRING, ((org.bukkit.Keyed) v.getVillagerType()).getKey().getKey()); } catch (Throwable ignored) {}
+        pdc.set(keyLevel, PersistentDataType.INTEGER, level);
+        if (custom != null) {
+            try { pdc.set(keyName, PersistentDataType.STRING, net.kyori.adventure.text.serializer.gson.GsonComponentSerializer.gson().serialize(custom)); } catch (Throwable ignored) {}
+        }
         egg.setItemMeta(meta);
         return egg;
     }
@@ -314,6 +376,216 @@ public class VillagerCapture extends LoadedPlugin implements Listener {
             return null;
         }
         return ent;
+    }
+
+    // ===================== REPLI (oeufs sans donnees) =====================
+
+    private Entity spawnFallback(ItemMeta meta, Location loc) {
+        if (meta == null || loc.getWorld() == null) return null;
+        PersistentDataContainer pdc = meta.getPersistentDataContainer();
+        String prof = pdc.get(keyProf, PersistentDataType.STRING);
+        Integer level = pdc.get(keyLevel, PersistentDataType.INTEGER);
+        String vtype = pdc.get(keyType, PersistentDataType.STRING);
+        Component name = null;
+        String nameJson = pdc.get(keyName, PersistentDataType.STRING);
+        if (nameJson != null) {
+            try { name = net.kyori.adventure.text.serializer.gson.GsonComponentSerializer.gson().deserialize(nameJson); } catch (Throwable ignored) {}
+        }
+        // Anciens oeufs : on relit le lore ("Metier : ...", "Niveau : ...", "Nom : ...").
+        List<Component> lore = null;
+        try { lore = meta.lore(); } catch (Throwable ignored) {}
+        if (lore != null) {
+            for (Component line : lore) {
+                Component c = line;
+                String plain;
+                try { plain = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText().serialize(c); } catch (Throwable t) { continue; }
+                if (prof == null && plain.startsWith("Metier : ")) prof = professionKey(plain.substring(9).trim());
+                else if (level == null && plain.startsWith("Niveau : ")) {
+                    try { level = Integer.parseInt(plain.substring(9).trim()); } catch (NumberFormatException ignored) {}
+                } else if (name == null && plain.startsWith("Nom : ")) {
+                    name = Component.text(plain.substring(6));
+                }
+            }
+        }
+        Villager v;
+        try {
+            v = loc.getWorld().spawn(loc, Villager.class);
+        } catch (Throwable t) {
+            getLogger().warning("[VillagerCapture] repli impossible : " + t);
+            return null;
+        }
+        if (vtype != null) {
+            Object t = registryGet("VILLAGER_TYPE", vtype);
+            if (t instanceof Villager.Type vt) try { v.setVillagerType(vt); } catch (Throwable ignored) {}
+        }
+        if (prof != null) {
+            Object pr = registryGet("VILLAGER_PROFESSION", prof);
+            if (pr instanceof Villager.Profession vp) try { v.setProfession(vp); } catch (Throwable ignored) {}
+        }
+        if (level != null && level >= 1 && level <= 5) {
+            try { v.setVillagerLevel(level); } catch (Throwable ignored) {}
+        }
+        if (name != null) {
+            try { v.customName(name); } catch (Throwable ignored) {}
+        }
+        try { v.setPersistent(true); } catch (Throwable ignored) {}
+        return v;
+    }
+
+    /** Registry Bukkit (VILLAGER_PROFESSION / VILLAGER_TYPE) -> valeur pour une cle minecraft:xxx. */
+    private Object registryGet(String field, String key) {
+        try {
+            Class<?> reg = Class.forName("org.bukkit.Registry");
+            Object r = reg.getField(field).get(null);
+            return reg.getMethod("get", NamespacedKey.class).invoke(r, NamespacedKey.minecraft(key.toLowerCase(Locale.ROOT)));
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** Nom francais du lore -> cle minecraft du metier. */
+    private static String professionKey(String fr) {
+        switch (fr) {
+            case "Aucun": return "none";
+            case "Idiot": return "nitwit";
+            case "Armurier": return "armorer";
+            case "Boucher": return "butcher";
+            case "Cartographe": return "cartographer";
+            case "Clerc": return "cleric";
+            case "Fermier": return "farmer";
+            case "Pecheur": return "fisherman";
+            case "Flechier": return "fletcher";
+            case "Tanneur": return "leatherworker";
+            case "Bibliothecaire": return "librarian";
+            case "Tailleur de pierre": return "mason";
+            case "Berger": return "shepherd";
+            case "Forgeron d'outils": return "toolsmith";
+            case "Forgeron d'armes": return "weaponsmith";
+            default: return fr.toLowerCase(Locale.ROOT);
+        }
+    }
+
+    private static String rootCause(Throwable t) {
+        Throwable c = t;
+        while ((c instanceof InvocationTargetException || c.getCause() != null) && c.getCause() != null && c.getCause() != c) c = c.getCause();
+        return c.getClass().getSimpleName() + ": " + c.getMessage();
+    }
+
+    // ===================== NBT (format de serializeEntity : NBT gzip) =====================
+    // Racine : [10][u16 longueur nom][nom][entrees...][0]
+
+    private static byte[] gunzip(byte[] d) throws IOException {
+        try (GZIPInputStream in = new GZIPInputStream(new ByteArrayInputStream(d))) {
+            return in.readAllBytes();
+        }
+    }
+
+    private static byte[] gzip(byte[] d) throws IOException {
+        ByteArrayOutputStream bo = new ByteArrayOutputStream();
+        try (GZIPOutputStream out = new GZIPOutputStream(bo)) {
+            out.write(d);
+        }
+        return bo.toByteArray();
+    }
+
+    private static int u16(byte[] b, int p) { return ((b[p] & 0xff) << 8) | (b[p + 1] & 0xff); }
+
+    private static int i32(byte[] b, int p) {
+        return ((b[p] & 0xff) << 24) | ((b[p + 1] & 0xff) << 16) | ((b[p + 2] & 0xff) << 8) | (b[p + 3] & 0xff);
+    }
+
+    private static String utf(byte[] b, int p) throws IOException {
+        return new DataInputStream(new ByteArrayInputStream(b, p, 2 + u16(b, p))).readUTF();
+    }
+
+    /** Position juste apres la charge utile d'un tag de type {@code type} commencant en {@code p}. */
+    private static int skip(byte[] b, int p, int type) {
+        switch (type) {
+            case 1: return p + 1;
+            case 2: return p + 2;
+            case 3: case 5: return p + 4;
+            case 4: case 6: return p + 8;
+            case 7: return p + 4 + i32(b, p);
+            case 8: return p + 2 + u16(b, p);
+            case 9: {
+                int et = b[p];
+                int n = i32(b, p + 1);
+                int q = p + 5;
+                for (int i = 0; i < n; i++) q = skip(b, q, et);
+                return q;
+            }
+            case 10: {
+                int q = p;
+                while (true) {
+                    int t = b[q++];
+                    if (t == 0) return q;
+                    q += 2 + u16(b, q);
+                    q = skip(b, q, t);
+                }
+            }
+            case 11: return p + 4 + 4 * i32(b, p);
+            case 12: return p + 4 + 8 * i32(b, p);
+            default: throw new IllegalStateException("tag NBT inconnu " + type);
+        }
+    }
+
+    private static int rootStart(byte[] raw) {
+        if (raw.length < 3 || raw[0] != 10) throw new IllegalStateException("racine NBT invalide");
+        return 3 + u16(raw, 1);
+    }
+
+    /** Liste des entrees de la racine : {debut, fin, type, nom}. */
+    private static List<Object[]> rootEntries(byte[] raw) throws IOException {
+        List<Object[]> out = new ArrayList<>();
+        int p = rootStart(raw);
+        while (p < raw.length) {
+            int type = raw[p];
+            if (type == 0) break;
+            String name = utf(raw, p + 1);
+            int payload = p + 3 + u16(raw, p + 1);
+            int end = skip(raw, payload, type);
+            out.add(new Object[]{p, end, type, name, payload});
+            p = end;
+        }
+        return out;
+    }
+
+    /** id d'entite contenu dans les donnees (null si absent ou vide). */
+    private static String entityIdOf(byte[] data) throws IOException {
+        byte[] raw = gunzip(data);
+        for (Object[] e : rootEntries(raw)) {
+            if ("id".equals(e[3]) && (int) e[2] == 8) {
+                String v = utf(raw, (int) e[4]);
+                return v.isEmpty() ? null : v;
+            }
+        }
+        return null;
+    }
+
+    /** Nombre d'entrees utiles (hors DataVersion) dans les donnees. */
+    private static int payloadEntries(byte[] data) throws IOException {
+        int n = 0;
+        for (Object[] e : rootEntries(gunzip(data))) if (!"DataVersion".equals(e[3]) && !"id".equals(e[3])) n++;
+        return n;
+    }
+
+    /** Copie des donnees avec l'id d'entite {@code id} (remplace un id vide/absent). */
+    private static byte[] withEntityId(byte[] data, String id) throws IOException {
+        byte[] raw = gunzip(data);
+        int start = rootStart(raw);
+        ByteArrayOutputStream bo = new ByteArrayOutputStream();
+        bo.write(raw, 0, start);
+        DataOutputStream out = new DataOutputStream(bo);
+        out.writeByte(8);
+        out.writeUTF("id");
+        out.writeUTF(id);
+        for (Object[] e : rootEntries(raw)) {
+            if ("id".equals(e[3])) continue;
+            int a = (int) e[0], b = (int) e[1];
+            bo.write(raw, a, b - a);
+        }
+        bo.write(0);
+        return gzip(bo.toByteArray());
     }
 
     // ===================== UTIL =====================
