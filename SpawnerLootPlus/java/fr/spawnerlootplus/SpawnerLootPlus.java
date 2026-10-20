@@ -10,8 +10,11 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Ajoute des mobs a la table de loot des spawners d'OptaShop.
@@ -22,6 +25,8 @@ import java.util.Map;
  *
  * Les 23 mobs deja geres par OptaShop gardent leur loot d'origine, sauf
  * IRON_GOLEM dont le loot est corrige ici (fer manquant).
+ * CAVE_SPIDER garde son loot d'origine et recoit en plus des toiles d'araignee
+ * (voir extend() : on complete la liste existante au lieu de l'ecraser).
  */
 public class SpawnerLootPlus extends LoadedPlugin {
 
@@ -149,6 +154,13 @@ public class SpawnerLootPlus extends LoadedPlugin {
                     d("IRON_INGOT", 3, 5, 1.0),
                     d("POPPY", 0, 2, 1.0));
 
+            // Araignee des cavernes : on GARDE le loot d'origine d'OptaShop (ficelle, oeil...)
+            // et on ajoute des toiles d'araignee. Si OptaShop n'avait pas d'entree, on part du
+            // loot vanilla (ficelle 0-2, oeil d'araignee 1/3).
+            extend(table, ctor, stringKeys, "CAVE_SPIDER",
+                    new Object[][]{d("STRING", 0, 2, 1.0), d("SPIDER_EYE", 0, 1, 0.33)},
+                    d("COBWEB", 1, 1, 0.50));
+
             int added = table.size() - before;
             getLogger().info("[SpawnerLootPlus] " + added + " mobs ajoutes a la table de loot OptaShop (total " + table.size() + ").");
             done = true;
@@ -159,6 +171,91 @@ public class SpawnerLootPlus extends LoadedPlugin {
             getLogger().warning("[SpawnerLootPlus] Injection impossible : " + t);
             return false;
         }
+    }
+
+    /**
+     * Complete le loot existant d'un mob (sans l'ecraser). Les drops d'un materiau deja
+     * present sont remplaces (ce qui rend l'operation idempotente avec /plreload).
+     * Si le mob n'a pas d'entree, on utilise {@code base} + les nouveaux drops.
+     */
+    private void extend(Map<Object, Object> table, Constructor<?> ctor, boolean stringKeys,
+                        String mobName, Object[][] base, Object[]... drops) {
+        EntityType type;
+        try {
+            type = EntityType.valueOf(mobName);
+        } catch (IllegalArgumentException ex) {
+            return;
+        }
+        Object key = stringKeys ? (Object) mobName : (Object) type;
+
+        Set<Material> replaced = new HashSet<Material>();
+        for (Object[] row : drops) {
+            try { replaced.add(Material.valueOf((String) row[0])); } catch (IllegalArgumentException ignored) { }
+        }
+
+        List<Object> list = new ArrayList<Object>();
+        Object current = table.get(key);
+        List<Object> existing = new ArrayList<Object>();
+        if (current instanceof Collection) {
+            existing.addAll((Collection<?>) current);
+        } else if (current != null && current.getClass().isArray()) {
+            int n = java.lang.reflect.Array.getLength(current);
+            for (int i = 0; i < n; i++) existing.add(java.lang.reflect.Array.get(current, i));
+        }
+
+        if (existing.isEmpty()) {
+            for (Object[] row : base) {
+                Object drop = newDrop(ctor, row);
+                if (drop != null) list.add(drop);
+            }
+        } else {
+            for (Object drop : existing) {
+                Material m = materialOf(drop);
+                if (m == null || !replaced.contains(m)) list.add(drop);
+            }
+        }
+        for (Object[] row : drops) {
+            Object drop = newDrop(ctor, row);
+            if (drop != null) list.add(drop);
+        }
+        if (list.isEmpty()) return;
+        table.put(key, list);
+
+        StringBuilder sb = new StringBuilder();
+        for (Object drop : list) {
+            Material m = materialOf(drop);
+            if (sb.length() > 0) sb.append(", ");
+            sb.append(m != null ? m.name() : "?");
+        }
+        getLogger().info("[SpawnerLootPlus] " + mobName + (existing.isEmpty() ? " (loot vanilla)" : " (loot OptaShop conserve)")
+                + " : " + sb + ".");
+    }
+
+    private static Object newDrop(Constructor<?> ctor, Object[] row) {
+        try {
+            Material mat = Material.valueOf((String) row[0]);
+            return ctor.newInstance(mat, row[1], row[2], row[3]);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** Materiau d'un drop OptaShop (premier champ de type Material). */
+    private static Material materialOf(Object drop) {
+        if (drop == null) return null;
+        for (Class<?> c = drop.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            for (Field f : c.getDeclaredFields()) {
+                if (f.getType() == Material.class && !Modifier.isStatic(f.getModifiers())) {
+                    try {
+                        f.setAccessible(true);
+                        return (Material) f.get(drop);
+                    } catch (Throwable ignored) {
+                        return null;
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     private static Object[] d(String material, int min, int max, double chance) {
