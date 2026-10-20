@@ -4,13 +4,21 @@ import fr.loader.api.LoadedPlugin;
 import org.bukkit.Bukkit;
 import org.bukkit.Material;
 import org.bukkit.entity.EntityType;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.HandlerList;
+import org.bukkit.event.Listener;
+import org.bukkit.event.entity.CreatureSpawnEvent;
+import org.bukkit.event.entity.SpawnerSpawnEvent;
 import org.bukkit.plugin.Plugin;
+import org.bukkit.plugin.RegisteredListener;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -27,8 +35,18 @@ import java.util.Set;
  * IRON_GOLEM dont le loot est corrige ici (fer manquant).
  * CAVE_SPIDER garde son loot d'origine et recoit en plus des toiles d'araignee
  * (voir extend() : on complete la liste existante au lieu de l'ecraser).
+ *
+ * SECURITE : les spawners de boss (Wither, Ender Dragon, Warden, Elder Guardian)
+ * ne font JAMAIS apparaitre de vrai mob (un vrai Wither detruisait les bases et
+ * tuait les villageois des qu'un joueur passait a moins de 16 blocs). Leur loot
+ * virtuel OptaShop continue de fonctionner normalement.
  */
-public class SpawnerLootPlus extends LoadedPlugin {
+public class SpawnerLootPlus extends LoadedPlugin implements Listener {
+
+    /** Mobs dont un spawner ne doit jamais faire apparaitre de vraie entite. */
+    private static final Set<String> NO_REAL_SPAWN = new HashSet<String>(java.util.Arrays.asList(
+            "WITHER", "ENDER_DRAGON", "WARDEN", "ELDER_GUARDIAN"));
+    private final Map<String, Long> lastLog = new HashMap<String, Long>();
 
     private static final String LOOT_CLASS = "net.optaland.shop.spawner.SpawnerLoot";
     private static final String DROP_CLASS = "net.optaland.shop.spawner.SpawnerLoot$Drop";
@@ -37,6 +55,12 @@ public class SpawnerLootPlus extends LoadedPlugin {
 
     @Override
     public void onEnable() {
+        unregisterStaleListeners();
+        try {
+            Bukkit.getPluginManager().registerEvents(this, getHost());
+        } catch (Throwable t) {
+            getLogger().warning("[SpawnerLootPlus] listener impossible a enregistrer : " + t);
+        }
         if (tryInject()) {
             return;
         }
@@ -49,6 +73,65 @@ public class SpawnerLootPlus extends LoadedPlugin {
                 }
             }, 100L);
         }
+    }
+
+    @Override
+    public void onDisable() {
+        try { HandlerList.unregisterAll(this); } catch (Throwable ignored) { }
+    }
+
+    // ---------------------------------------------------------------- securite boss
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onSpawnerSpawn(SpawnerSpawnEvent e) {
+        if (!NO_REAL_SPAWN.contains(e.getEntityType().name())) {
+            return;
+        }
+        e.setCancelled(true);
+        logBlocked(e.getEntityType().name(), e.getLocation());
+    }
+
+    /** Filet de securite : toute apparition "SPAWNER" d'un boss est annulee. */
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onCreatureSpawn(CreatureSpawnEvent e) {
+        if (e.getSpawnReason() != CreatureSpawnEvent.SpawnReason.SPAWNER) {
+            return;
+        }
+        if (!NO_REAL_SPAWN.contains(e.getEntityType().name())) {
+            return;
+        }
+        e.setCancelled(true);
+        logBlocked(e.getEntityType().name(), e.getLocation());
+    }
+
+    private void logBlocked(String mob, org.bukkit.Location l) {
+        if (l == null || l.getWorld() == null) {
+            return;
+        }
+        String key = l.getWorld().getName() + ":" + l.getBlockX() / 16 + ":" + l.getBlockZ() / 16 + ":" + mob;
+        long now = System.currentTimeMillis();
+        Long last = lastLog.get(key);
+        if (last != null && now - last < 600000L) {
+            return; // un message par zone et par 10 minutes
+        }
+        lastLog.put(key, now);
+        getLogger().info("[SpawnerLootPlus] apparition reelle de " + mob + " bloquee pres de "
+                + l.getWorld().getName() + " " + l.getBlockX() + " " + l.getBlockY() + " " + l.getBlockZ()
+                + " (le loot virtuel du spawner continue).");
+    }
+
+    private void unregisterStaleListeners() {
+        try {
+            String myClass = getClass().getName();
+            for (HandlerList hl : HandlerList.getHandlerLists()) {
+                for (RegisteredListener rl : hl.getRegisteredListeners()) {
+                    Object l = rl.getListener();
+                    if (l != null && l != this && l.getClass().getName().equals(myClass)) {
+                        try { hl.unregister(rl); } catch (Throwable ignored) { }
+                    }
+                }
+            }
+        } catch (Throwable ignored) { }
     }
 
     private boolean tryInject() {
