@@ -36,6 +36,8 @@ public class ExaliumCraft extends LoadedPlugin {
 
     private boolean handle(CommandSender s, org.bukkit.command.Command c, String label, String[] args) {
         if (s instanceof org.bukkit.entity.Player p && !p.isOp()) { s.sendMessage("Reserve aux OP."); return true; }
+        if (args.length >= 1 && args[0].equalsIgnoreCase("test")) { test(s, args.length >= 2 ? args[1] : null); return true; }
+        if (args.length >= 2 && args[0].equalsIgnoreCase("inv")) { inv(s, args[1]); return true; }
         int n = 0;
         Iterator<Recipe> it = Bukkit.recipeIterator();
         while (it.hasNext()) {
@@ -65,6 +67,77 @@ public class ExaliumCraft extends LoadedPlugin {
         listeners("CraftItemEvent", CraftItemEvent.getHandlerList().getRegisteredListeners());
         s.sendMessage("Diagnostic ecrit dans la console (" + n + " recettes).");
         return true;
+    }
+
+    /** Simule chaque recette exalium avec des objets neufs (et pour un joueur si donne). */
+    private void test(CommandSender s, String playerName) {
+        org.bukkit.entity.Player pl = playerName == null ? null : Bukkit.getPlayerExact(playerName);
+        org.bukkit.World w = pl != null ? pl.getWorld() : Bukkit.getWorlds().get(0);
+        Iterator<Recipe> it = Bukkit.recipeIterator();
+        while (it.hasNext()) {
+            Recipe r;
+            try { r = it.next(); } catch (Throwable t) { continue; }
+            if (!(r instanceof ShapedRecipe sr) || !sr.getKey().getNamespace().equals("exalium")) continue;
+            ItemStack[] m = new ItemStack[9];
+            String[] shape = sr.getShape();
+            Map<Character, RecipeChoice> cm = sr.getChoiceMap();
+            for (int row = 0; row < shape.length; row++) {
+                for (int col = 0; col < shape[row].length(); col++) {
+                    RecipeChoice ch = cm.get(shape[row].charAt(col));
+                    ItemStack item = null;
+                    if (ch instanceof RecipeChoice.ExactChoice ec) item = ec.getChoices().get(0).clone();
+                    else if (ch instanceof RecipeChoice.MaterialChoice mc) item = new ItemStack(mc.getChoices().get(0));
+                    m[row * 3 + col] = item;
+                }
+            }
+            String noPlayer, withPlayer = "-";
+            try {
+                Recipe found = Bukkit.getCraftingRecipe(cloneAll(m), w);
+                ItemStack res = Bukkit.craftItem(cloneAll(m), w);
+                noPlayer = "recette=" + ((found instanceof Keyed k) ? k.getKey().toString() : "AUCUNE") + " resultat=" + desc(res);
+            } catch (Throwable t) { noPlayer = "erreur " + t; }
+            if (pl != null) {
+                try { withPlayer = desc(Bukkit.craftItem(cloneAll(m), w, pl)); } catch (Throwable t) { withPlayer = "erreur " + t; }
+            }
+            getLogger().info("[ExaliumCraft] TEST " + sr.getKey().getKey() + " : " + noPlayer + " | pour " + playerName + " : " + withPlayer);
+        }
+        s.sendMessage("Test ecrit dans la console.");
+    }
+
+    /** Objets exalium de l'inventaire d'un joueur compares aux objets neufs. */
+    private void inv(CommandSender s, String name) {
+        org.bukkit.entity.Player pl = Bukkit.getPlayerExact(name);
+        if (pl == null) { s.sendMessage("Joueur hors ligne."); return; }
+        int slot = 0;
+        for (ItemStack i : pl.getInventory().getContents()) {
+            slot++;
+            String id = iaId(i);
+            if (id == null || !id.startsWith("exalium:")) continue;
+            ItemStack fresh = freshIa(id);
+            boolean sim = fresh != null && fresh.isSimilar(i);
+            getLogger().info("[ExaliumCraft] INV " + name + " slot " + (slot - 1) + " " + id + " x" + i.getAmount()
+                    + " identique-au-neuf=" + sim + (sim ? "" : " | joueur=" + i.getItemMeta() + " | neuf=" + (fresh == null ? null : fresh.getItemMeta())));
+        }
+        s.sendMessage("Inventaire ecrit dans la console.");
+    }
+
+    private static ItemStack[] cloneAll(ItemStack[] m) {
+        ItemStack[] c = new ItemStack[m.length];
+        for (int i = 0; i < m.length; i++) c[i] = m[i] == null ? null : m[i].clone();
+        return c;
+    }
+
+    private static String desc(ItemStack i) {
+        if (i == null || i.getType().isAir()) return "RIEN";
+        return i.getType() + " x" + i.getAmount() + " ia=" + iaId(i);
+    }
+
+    private static ItemStack freshIa(String id) {
+        try {
+            Class<?> cs = iaClass();
+            Object st = cs.getMethod("getInstance", String.class).invoke(null, id);
+            return st == null ? null : (ItemStack) cs.getMethod("getItemStack").invoke(st);
+        } catch (Throwable t) { return null; }
     }
 
     private void listeners(String name, RegisteredListener[] arr) {
