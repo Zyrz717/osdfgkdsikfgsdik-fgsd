@@ -2,7 +2,13 @@ package fr.spawnerlootplus;
 
 import fr.loader.api.LoadedPlugin;
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
 import org.bukkit.Material;
+import org.bukkit.World;
+import org.bukkit.block.Block;
+import org.bukkit.block.CreatureSpawner;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Player;
 import org.bukkit.entity.EntityType;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -40,6 +46,15 @@ import java.util.Set;
  * ne font JAMAIS apparaitre de vrai mob (un vrai Wither detruisait les bases et
  * tuait les villageois des qu'un joueur passait a moins de 16 blocs). Leur loot
  * virtuel OptaShop continue de fonctionner normalement.
+ *
+ * SPAWNERS NON ENREGISTRES : OptaShop n'empeche les vrais mobs QUE pour les spawners
+ * qu'il a enregistres (spawners.yml). Un spawner pose autrement (WorldEdit, Axiom,
+ * avant l'installation...) fait apparaitre de vrais mobs. Commandes (OP / console) :
+ *   /spawnerloot scan [rayon]              liste les spawners autour de toi (enregistres ou non)
+ *   /spawnerloot scan x y z [rayon] [monde] idem depuis la console
+ *   /spawnerloot adopt x y z [monde]       enregistre ce spawner dans OptaShop (loot virtuel)
+ *   /spawnerloot adoptall [rayon]          enregistre tous les spawners non enregistres autour de toi
+ * Chaque vrai mob venant d'un spawner non enregistre est aussi signale dans la console.
  */
 public class SpawnerLootPlus extends LoadedPlugin implements Listener {
 
@@ -56,6 +71,10 @@ public class SpawnerLootPlus extends LoadedPlugin implements Listener {
     @Override
     public void onEnable() {
         unregisterStaleListeners();
+        registerCommand("spawnerloot", (sender, cmd, label, args) -> {
+            handleCommand(sender, args);
+            return true;
+        });
         try {
             Bukkit.getPluginManager().registerEvents(this, getHost());
         } catch (Throwable t) {
@@ -78,6 +97,159 @@ public class SpawnerLootPlus extends LoadedPlugin implements Listener {
     @Override
     public void onDisable() {
         try { HandlerList.unregisterAll(this); } catch (Throwable ignored) { }
+    }
+
+    // ---------------------------------------------------------------- spawners non enregistres
+
+    /** Signale les vrais mobs venant d'un spawner qu'OptaShop ne gere pas (non annules). */
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onUnmanagedSpawn(SpawnerSpawnEvent e) {
+        CreatureSpawner sp = e.getSpawner();
+        if (sp == null) {
+            return;
+        }
+        Location l = sp.getBlock().getLocation();
+        String key = "unmanaged:" + l.getWorld().getName() + ":" + l.getBlockX() + ":" + l.getBlockY() + ":" + l.getBlockZ();
+        long now = System.currentTimeMillis();
+        Long last = lastLog.get(key);
+        if (last != null && now - last < 1800000L) {
+            return; // un message par spawner et par 30 minutes
+        }
+        lastLog.put(key, now);
+        getLogger().info("[SpawnerLootPlus] spawner NON enregistre dans OptaShop (" + e.getEntityType().name() + ") en "
+                + l.getWorld().getName() + " " + l.getBlockX() + " " + l.getBlockY() + " " + l.getBlockZ()
+                + " : il fait apparaitre de vrais mobs. Pour le passer en loot virtuel : spawnerloot adopt "
+                + l.getBlockX() + " " + l.getBlockY() + " " + l.getBlockZ() + " " + l.getWorld().getName());
+    }
+
+    private Object spawnerManager() throws Exception {
+        Plugin ob = Bukkit.getPluginManager().getPlugin("OptaShop");
+        if (ob == null || !ob.isEnabled()) {
+            throw new IllegalStateException("OptaShop introuvable");
+        }
+        return ob.getClass().getMethod("getSpawnerManager").invoke(ob);
+    }
+
+    private boolean isRegistered(Object mgr, Location l) throws Exception {
+        return mgr.getClass().getMethod("get", Location.class).invoke(mgr, l) != null;
+    }
+
+    /** Enregistre le spawner du bloc dans OptaShop. Renvoie un message de resultat. */
+    private String adopt(Object mgr, Block b, boolean save) throws Exception {
+        if (b.getType() != Material.SPAWNER || !(b.getState() instanceof CreatureSpawner)) {
+            return "pas de spawner en " + b.getX() + " " + b.getY() + " " + b.getZ();
+        }
+        if (isRegistered(mgr, b.getLocation())) {
+            return "deja enregistre : " + b.getX() + " " + b.getY() + " " + b.getZ();
+        }
+        EntityType mob = ((CreatureSpawner) b.getState()).getSpawnedType();
+        if (mob == null) {
+            return "spawner vide (aucun mob) en " + b.getX() + " " + b.getY() + " " + b.getZ();
+        }
+        Plugin ob = Bukkit.getPluginManager().getPlugin("OptaShop");
+        Class<?> dataCls = Class.forName("net.optaland.shop.spawner.SpawnerData", true, ob.getClass().getClassLoader());
+        Object data = dataCls.getConstructor(String.class, int.class, int.class, int.class, EntityType.class, int.class)
+                .newInstance(b.getWorld().getName(), b.getX(), b.getY(), b.getZ(), mob, 1);
+        mgr.getClass().getMethod("register", dataCls).invoke(mgr, data);
+        if (save) {
+            mgr.getClass().getMethod("save").invoke(mgr);
+        }
+        getLogger().info("[SpawnerLootPlus] spawner " + mob.name() + " en " + b.getWorld().getName() + " "
+                + b.getX() + " " + b.getY() + " " + b.getZ() + " enregistre dans OptaShop.");
+        return "enregistre : " + mob.name() + " en " + b.getX() + " " + b.getY() + " " + b.getZ();
+    }
+
+    private List<Block> spawnersAround(Location c, int r) {
+        List<Block> out = new ArrayList<Block>();
+        World w = c.getWorld();
+        int cx = c.getBlockX(), cy = c.getBlockY(), cz = c.getBlockZ();
+        int minY = Math.max(w.getMinHeight(), cy - r), maxY = Math.min(w.getMaxHeight() - 1, cy + r);
+        for (int x = cx - r; x <= cx + r; x++) {
+            for (int z = cz - r; z <= cz + r; z++) {
+                if (!w.isChunkLoaded(x >> 4, z >> 4)) {
+                    continue;
+                }
+                for (int y = minY; y <= maxY; y++) {
+                    Block b = w.getBlockAt(x, y, z);
+                    if (b.getType() == Material.SPAWNER) {
+                        out.add(b);
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    private void msg(CommandSender s, String text) {
+        s.sendMessage(net.kyori.adventure.text.Component.text("[SpawnerLoot] ", net.kyori.adventure.text.format.NamedTextColor.GOLD)
+                .append(net.kyori.adventure.text.Component.text(text, net.kyori.adventure.text.format.NamedTextColor.GRAY)));
+    }
+
+    private void handleCommand(CommandSender s, String[] a) {
+        if (!(s.isOp() || !(s instanceof Player))) {
+            msg(s, "Reserve aux OP.");
+            return;
+        }
+        if (a.length == 0) {
+            msg(s, "/spawnerloot scan [rayon]  |  /spawnerloot adopt x y z [monde]  |  /spawnerloot adoptall [rayon]");
+            return;
+        }
+        try {
+            Object mgr = spawnerManager();
+            String sub = a[0].toLowerCase(java.util.Locale.ROOT);
+            if (sub.equals("adopt")) {
+                if (a.length < 4) { msg(s, "Usage : /spawnerloot adopt x y z [monde]"); return; }
+                World w = a.length >= 5 ? Bukkit.getWorld(a[4]) : (s instanceof Player ? ((Player) s).getWorld() : Bukkit.getWorlds().get(0));
+                if (w == null) { msg(s, "Monde introuvable."); return; }
+                Block b = w.getBlockAt(Integer.parseInt(a[1]), Integer.parseInt(a[2]), Integer.parseInt(a[3]));
+                msg(s, adopt(mgr, b, true));
+                return;
+            }
+            Location center;
+            int r;
+            if (s instanceof Player && (a.length <= 2)) {
+                center = ((Player) s).getLocation();
+                r = a.length >= 2 ? Integer.parseInt(a[1]) : 16;
+            } else {
+                if (a.length < 4) { msg(s, "Depuis la console : /spawnerloot " + sub + " x y z [rayon] [monde]"); return; }
+                World w = a.length >= 6 ? Bukkit.getWorld(a[5]) : Bukkit.getWorlds().get(0);
+                if (w == null) { msg(s, "Monde introuvable."); return; }
+                center = new Location(w, Integer.parseInt(a[1]), Integer.parseInt(a[2]), Integer.parseInt(a[3]));
+                r = a.length >= 5 ? Integer.parseInt(a[4]) : 16;
+            }
+            r = Math.max(1, Math.min(32, r));
+            List<Block> found = spawnersAround(center, r);
+            if (sub.equals("scan")) {
+                msg(s, found.size() + " spawner(s) dans un rayon de " + r + " blocs :");
+                for (Block b : found) {
+                    EntityType t = b.getState() instanceof CreatureSpawner ? ((CreatureSpawner) b.getState()).getSpawnedType() : null;
+                    msg(s, " - " + (t == null ? "?" : t.name()) + " en " + b.getX() + " " + b.getY() + " " + b.getZ()
+                            + (isRegistered(mgr, b.getLocation()) ? "  (OptaShop : ok)" : "  (NON enregistre -> vrais mobs)"));
+                }
+                return;
+            }
+            if (sub.equals("adoptall")) {
+                int n = 0;
+                for (Block b : found) {
+                    if (!isRegistered(mgr, b.getLocation())) {
+                        msg(s, adopt(mgr, b, false));
+                        n++;
+                    }
+                }
+                if (n > 0) {
+                    mgr.getClass().getMethod("save").invoke(mgr);
+                }
+                msg(s, n + " spawner(s) enregistre(s) dans OptaShop.");
+                return;
+            }
+            msg(s, "Sous-commande inconnue.");
+        } catch (NumberFormatException ex) {
+            msg(s, "Coordonnees / rayon invalides.");
+        } catch (Throwable t) {
+            Throwable c = t.getCause() != null ? t.getCause() : t;
+            msg(s, "Erreur : " + c);
+            getLogger().warning("[SpawnerLootPlus] commande KO : " + c);
+        }
     }
 
     // ---------------------------------------------------------------- securite boss
