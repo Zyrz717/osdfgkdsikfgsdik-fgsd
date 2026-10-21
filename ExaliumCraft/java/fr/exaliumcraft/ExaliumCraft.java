@@ -37,6 +37,7 @@ public class ExaliumCraft extends LoadedPlugin {
     private boolean handle(CommandSender s, org.bukkit.command.Command c, String label, String[] args) {
         if (s instanceof org.bukkit.entity.Player p && !p.isOp()) { s.sendMessage("Reserve aux OP."); return true; }
         if (args.length >= 1 && args[0].equalsIgnoreCase("test")) { test(s, args.length >= 2 ? args[1] : null); return true; }
+        if (args.length >= 1 && args[0].equalsIgnoreCase("smelt")) { smelt(s); return true; }
         if (args.length >= 2 && args[0].equalsIgnoreCase("inv")) { inv(s, args[1]); return true; }
         int n = 0;
         Iterator<Recipe> it = Bukkit.recipeIterator();
@@ -119,6 +120,40 @@ public class ExaliumCraft extends LoadedPlugin {
                     + " identique-au-neuf=" + sim + (sim ? "" : " | joueur=" + i.getItemMeta() + " | neuf=" + (fresh == null ? null : fresh.getItemMeta())));
         }
         s.sendMessage("Inventaire ecrit dans la console.");
+    }
+
+    /** Vrai test de cuisson : four + haut fourneau avec de l'exalium brut neuf, loin de tout. */
+    private void smelt(CommandSender s) {
+        final org.bukkit.World w = Bukkit.getWorlds().get(0);
+        final int x = 7000, y = 241, z = -7000;
+        w.setChunkForceLoaded(x >> 4, z >> 4, true);
+        final org.bukkit.block.Block[] blocks = { w.getBlockAt(x, y, z), w.getBlockAt(x + 2, y, z) };
+        blocks[0].setType(org.bukkit.Material.FURNACE);
+        blocks[1].setType(org.bukkit.Material.BLAST_FURNACE);
+        ItemStack raw = freshIa("exalium:raw_exalium");
+        if (raw == null) { s.sendMessage("exalium:raw_exalium introuvable."); return; }
+        for (org.bukkit.block.Block b : blocks) {
+            org.bukkit.block.Furnace f = (org.bukkit.block.Furnace) b.getState();
+            org.bukkit.inventory.FurnaceInventory inv = f.getInventory();
+            inv.setSmelting(raw.clone());
+            inv.setFuel(new ItemStack(org.bukkit.Material.COAL, 2));
+        }
+        s.sendMessage("Cuisson lancee, resultat dans 13 s (console).");
+        Bukkit.getScheduler().runTaskLater((org.bukkit.plugin.Plugin) getHost(), () -> {
+            for (org.bukkit.block.Block b : blocks) {
+                try {
+                    org.bukkit.block.Furnace f = (org.bukkit.block.Furnace) b.getState();
+                    org.bukkit.inventory.FurnaceInventory inv = f.getInventory();
+                    getLogger().info("[ExaliumCraft] SMELT " + b.getType() + " : entree=" + desc(inv.getSmelting())
+                            + " resultat=" + desc(inv.getResult()) + " combustible=" + desc(inv.getFuel()));
+                    inv.clear();
+                } catch (Throwable t) {
+                    getLogger().info("[ExaliumCraft] SMELT erreur " + t);
+                }
+                b.setType(org.bukkit.Material.AIR);
+            }
+            w.setChunkForceLoaded(x >> 4, z >> 4, false);
+        }, 260L);
     }
 
     private static ItemStack[] cloneAll(ItemStack[] m) {
