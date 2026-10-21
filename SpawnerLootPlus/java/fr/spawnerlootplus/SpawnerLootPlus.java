@@ -55,6 +55,18 @@ import java.util.Set;
  *   /spawnerloot adopt x y z [monde]       enregistre ce spawner dans OptaShop (loot virtuel)
  *   /spawnerloot adoptall [rayon]          enregistre tous les spawners non enregistres autour de toi
  * Chaque vrai mob venant d'un spawner non enregistre est aussi signale dans la console.
+ *
+ * ZONE PROTEGEE AUTOUR DES SPAWNERS OPTASHOP : OptaShop n'annule que l'evenement
+ * "spawner" vanilla. D'autres chemins font quand meme apparaitre le mob du spawner
+ * juste a cote : apparition naturelle (zombies/endermen dans le noir), plugins qui
+ * appellent world.spawnEntity (ForceTick en chunk /forceload, MythicMobs...), renforts
+ * de zombies, etc. Desormais, dans un rayon de 24 blocs (16 en hauteur) autour d'un
+ * spawner enregistre dans OptaShop, aucun mob du MEME type que ce spawner ne peut
+ * apparaitre automatiquement (naturel, spawner, plugin, renforts...). Les actions
+ * volontaires restent permises (construire un Wither, oeuf, /summon, elevage, golems
+ * de village...). /spawnerloot zones : liste et compteurs. Les mobs de ce type deja presents
+ * dans la zone (charges depuis le disque) sont retires s'ils viennent d'une
+ * apparition automatique. Liste des zones relue depuis plugins/OptaShop/spawners.yml.
  */
 public class SpawnerLootPlus extends LoadedPlugin implements Listener {
 
@@ -80,6 +92,7 @@ public class SpawnerLootPlus extends LoadedPlugin implements Listener {
         } catch (Throwable t) {
             getLogger().warning("[SpawnerLootPlus] listener impossible a enregistrer : " + t);
         }
+        startZones();
         if (tryInject()) {
             return;
         }
@@ -96,7 +109,150 @@ public class SpawnerLootPlus extends LoadedPlugin implements Listener {
 
     @Override
     public void onDisable() {
+        try { if (zoneTask != null) zoneTask.cancel(); } catch (Throwable ignored) { }
         try { HandlerList.unregisterAll(this); } catch (Throwable ignored) { }
+    }
+
+    // ---------------------------------------------------------------- zones protegees
+
+    private static final int ZONE_XZ = 24, ZONE_Y = 16;
+    /**
+     * Causes d'apparition AUTOMATIQUES bloquees dans la zone. Tout le reste reste permis :
+     * actions de joueurs (BUILD_WITHER, oeuf, /summon, elevage...), golems de village, conversions...
+     */
+    private static final Set<String> BLOCKED_REASONS = new HashSet<String>(java.util.Arrays.asList(
+            "NATURAL", "SPAWNER", "CUSTOM", "DEFAULT", "CHUNK_GEN", "REINFORCEMENTS", "NETHER_PORTAL",
+            "PATROL", "RAID", "JOCKEY", "MOUNT"));
+
+    private static final class Zone {
+        final String world; final int x, y, z; final String mob;
+        Zone(String w, int x, int y, int z, String m) { world = w; this.x = x; this.y = y; this.z = z; mob = m; }
+        boolean contains(Location l) {
+            return l.getWorld() != null && l.getWorld().getName().equals(world)
+                    && Math.abs(l.getBlockX() - x) <= ZONE_XZ && Math.abs(l.getBlockZ() - z) <= ZONE_XZ
+                    && Math.abs(l.getBlockY() - y) <= ZONE_Y;
+        }
+    }
+
+    private volatile List<Zone> zones = new ArrayList<Zone>();
+    private long zonesLoadedAt = 0;
+    private org.bukkit.scheduler.BukkitTask zoneTask;
+    private long blockedCount = 0, removedCount = 0;
+
+    private void startZones() {
+        reloadZones();
+        getLogger().info("[SpawnerLootPlus] zones protegees : " + zones.size() + " spawner(s) OptaShop, rayon " + ZONE_XZ + " blocs.");
+        try {
+            zoneTask = Bukkit.getScheduler().runTaskTimer(getHost(), new Runnable() {
+                @Override
+                public void run() {
+                    if (System.currentTimeMillis() - zonesLoadedAt > 60000L) reloadZones();
+                    sweepZones();
+                }
+            }, 100L, 200L);
+        } catch (Throwable t) {
+            getLogger().warning("[SpawnerLootPlus] tache des zones impossible : " + t);
+        }
+    }
+
+    /** Relit plugins/OptaShop/spawners.yml. */
+    private void reloadZones() {
+        zonesLoadedAt = System.currentTimeMillis();
+        try {
+            java.io.File f = new java.io.File(Bukkit.getWorldContainer(), "plugins/OptaShop/spawners.yml");
+            Plugin ob = Bukkit.getPluginManager().getPlugin("OptaShop");
+            if (ob != null) f = new java.io.File(ob.getDataFolder(), "spawners.yml");
+            if (!f.isFile()) return;
+            org.bukkit.configuration.file.YamlConfiguration y = org.bukkit.configuration.file.YamlConfiguration.loadConfiguration(f);
+            List<Zone> out = new ArrayList<Zone>();
+            for (Map<?, ?> m : y.getMapList("spawners")) {
+                try {
+                    Object w = m.get("world"), mob = m.get("mob");
+                    if (w == null || mob == null) continue;
+                    out.add(new Zone(String.valueOf(w), ((Number) m.get("x")).intValue(), ((Number) m.get("y")).intValue(),
+                            ((Number) m.get("z")).intValue(), String.valueOf(mob).toUpperCase(java.util.Locale.ROOT)));
+                } catch (Throwable ignored) { }
+            }
+            zones = out;
+        } catch (Throwable t) {
+            getLogger().warning("[SpawnerLootPlus] lecture de spawners.yml impossible : " + t);
+        }
+    }
+
+    private Zone zoneFor(String mob, Location l) {
+        for (Zone z : zones) if (z.mob.equals(mob) && z.contains(l)) return z;
+        return null;
+    }
+
+    /** Toute apparition automatique du mob d'un spawner OptaShop dans sa zone est annulee. */
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onZoneSpawn(CreatureSpawnEvent e) {
+        String reason = e.getSpawnReason().name();
+        if (!BLOCKED_REASONS.contains(reason)) return;
+        Zone z = zoneFor(e.getEntityType().name(), e.getLocation());
+        if (z == null) return;
+        e.setCancelled(true);
+        blockedCount++;
+        String key = "zone:" + z.world + ":" + z.x + ":" + z.y + ":" + z.z + ":" + reason;
+        long now = System.currentTimeMillis();
+        Long last = lastLog.get(key);
+        if (last == null || now - last > 600000L) {
+            lastLog.put(key, now);
+            getLogger().info("[SpawnerLootPlus] zone du spawner " + z.mob + " (" + z.x + " " + z.y + " " + z.z + ") : apparition "
+                    + reason + " de " + e.getEntityType().name() + " bloquee en " + e.getLocation().getBlockX() + " "
+                    + e.getLocation().getBlockY() + " " + e.getLocation().getBlockZ() + ".");
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onZoneEntitiesLoad(org.bukkit.event.world.EntitiesLoadEvent e) {
+        for (org.bukkit.entity.Entity ent : e.getEntities()) cleanup(ent, "chargement");
+    }
+
+    private void sweepZones() {
+        for (Zone z : zones) {
+            World w = Bukkit.getWorld(z.world);
+            if (w == null || !w.isChunkLoaded(z.x >> 4, z.z >> 4)) continue;
+            try {
+                for (org.bukkit.entity.Entity ent : w.getNearbyEntities(new Location(w, z.x + 0.5, z.y + 0.5, z.z + 0.5), ZONE_XZ, ZONE_Y, ZONE_XZ)) {
+                    cleanup(ent, "zone");
+                }
+            } catch (Throwable ignored) { }
+        }
+    }
+
+    /** Retire un mob de la zone s'il vient d'une apparition automatique (jamais un mob nomme / attache / monte). */
+    private void cleanup(org.bukkit.entity.Entity ent, String where) {
+        try {
+            if (!(ent instanceof org.bukkit.entity.LivingEntity) || ent instanceof Player || !ent.isValid()) return;
+            Zone z = zoneFor(ent.getType().name(), ent.getLocation());
+            if (z == null) return;
+            if (ent.customName() != null || !ent.getPassengers().isEmpty() || ent.getVehicle() != null) return;
+            if (ent instanceof org.bukkit.entity.LivingEntity le && le.isLeashed()) return;
+            String reason = spawnReasonOf(ent);
+            if (reason == null || !BLOCKED_REASONS.contains(reason)) return;
+            Location l = ent.getLocation();
+            ent.remove();
+            removedCount++;
+            String key = "rm:" + z.world + ":" + z.x + ":" + z.y + ":" + z.z + ":" + reason;
+            long now = System.currentTimeMillis();
+            Long last = lastLog.get(key);
+            if (last == null || now - last > 600000L) {
+                lastLog.put(key, now);
+                getLogger().info("[SpawnerLootPlus] zone du spawner " + z.mob + " (" + z.x + " " + z.y + " " + z.z + ") : "
+                        + ent.getType().name() + " (" + reason + ", " + where + ") retire en " + l.getBlockX() + " " + l.getBlockY() + " " + l.getBlockZ() + ".");
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    /** Entity#getEntitySpawnReason (API Paper) par reflexion ; null si indisponible. */
+    private static String spawnReasonOf(org.bukkit.entity.Entity ent) {
+        try {
+            Object r = ent.getClass().getMethod("getEntitySpawnReason").invoke(ent);
+            return r == null ? null : String.valueOf(r);
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     // ---------------------------------------------------------------- spawners non enregistres
@@ -191,7 +347,13 @@ public class SpawnerLootPlus extends LoadedPlugin implements Listener {
             return;
         }
         if (a.length == 0) {
-            msg(s, "/spawnerloot scan [rayon]  |  /spawnerloot adopt x y z [monde]  |  /spawnerloot adoptall [rayon]");
+            msg(s, "/spawnerloot scan [rayon]  |  /spawnerloot adopt x y z [monde]  |  /spawnerloot adoptall [rayon]  |  /spawnerloot zones");
+            return;
+        }
+        if (a[0].equalsIgnoreCase("zones")) {
+            msg(s, zones.size() + " zone(s) protegee(s) (rayon " + ZONE_XZ + ", hauteur " + ZONE_Y + ") - apparitions bloquees : "
+                    + blockedCount + ", mobs retires : " + removedCount);
+            for (Zone z : zones) msg(s, " - " + z.mob + " en " + z.world + " " + z.x + " " + z.y + " " + z.z);
             return;
         }
         try {
