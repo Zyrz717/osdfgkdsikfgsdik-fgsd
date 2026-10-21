@@ -23,16 +23,60 @@ import java.util.Map;
  *   /exaliumcraft diag : liste les recettes Bukkit qui produisent un objet exalium
  *                        et les plugins qui ecoutent le craft.
  */
-public class ExaliumCraft extends LoadedPlugin {
+public class ExaliumCraft extends LoadedPlugin implements org.bukkit.event.Listener {
 
     @Override
     public void onEnable() {
         registerCommand("exaliumcraft", this::handle);
+        try {
+            for (org.bukkit.event.HandlerList hl : org.bukkit.event.HandlerList.getHandlerLists()) {
+                for (RegisteredListener rl : hl.getRegisteredListeners()) {
+                    Object l = rl.getListener();
+                    if (l != null && l != this && l.getClass().getName().equals(getClass().getName())) hl.unregister(rl);
+                }
+            }
+            Bukkit.getPluginManager().registerEvents(this, (org.bukkit.plugin.Plugin) getHost());
+        } catch (Throwable t) { getLogger().warning("[ExaliumCraft] listener impossible : " + t); }
         getLogger().info("[ExaliumCraft] actif - /exaliumcraft diag");
     }
 
     @Override
-    public void onDisable() {}
+    public void onDisable() {
+        try { org.bukkit.event.HandlerList.unregisterAll(this); } catch (Throwable ignored) {}
+    }
+
+    // ===== Journal des essais de craft avec de l'exalium (diagnostic) =====
+    private final java.util.Map<java.util.UUID, Long> lastPrep = new java.util.HashMap<>();
+
+    @org.bukkit.event.EventHandler(priority = org.bukkit.event.EventPriority.MONITOR)
+    public void onPrepare(PrepareItemCraftEvent e) {
+        ItemStack[] m = e.getInventory().getMatrix();
+        StringBuilder sb = new StringBuilder();
+        boolean ex = false;
+        for (int i = 0; i < m.length; i++) {
+            String id = iaId(m[i]);
+            if (id != null && id.startsWith("exalium:")) ex = true;
+            sb.append(m[i] == null || m[i].getType().isAir() ? "." : (id != null ? id.replace("exalium:", "") : m[i].getType().name().toLowerCase())).append(i % 3 == 2 && m.length == 9 ? " / " : ",");
+        }
+        if (!ex) return;
+        java.util.UUID u = e.getView().getPlayer().getUniqueId();
+        long now = System.currentTimeMillis();
+        Long last = lastPrep.get(u);
+        if (last != null && now - last < 700) return;
+        lastPrep.put(u, now);
+        Recipe r = e.getRecipe();
+        getLogger().info("[ExaliumCraft] ESSAI " + e.getView().getPlayer().getName() + " grille=" + sb + " recette="
+                + ((r instanceof Keyed k) ? k.getKey().toString() : "AUCUNE") + " resultat=" + desc(e.getInventory().getResult())
+                + " type=" + e.getInventory().getType());
+    }
+
+    @org.bukkit.event.EventHandler(priority = org.bukkit.event.EventPriority.MONITOR)
+    public void onCraft(CraftItemEvent e) {
+        String rid = iaId(e.getCurrentItem());
+        if (rid == null || !rid.startsWith("exalium:")) return;
+        getLogger().info("[ExaliumCraft] CRAFT " + e.getWhoClicked().getName() + " " + rid + " annule=" + e.isCancelled()
+                + " clic=" + e.getClick() + " action=" + e.getAction());
+    }
 
     private boolean handle(CommandSender s, org.bukkit.command.Command c, String label, String[] args) {
         if (s instanceof org.bukkit.entity.Player p && !p.isOp()) { s.sendMessage("Reserve aux OP."); return true; }
