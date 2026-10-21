@@ -12,16 +12,23 @@ import org.bukkit.NamespacedKey;
 import org.bukkit.Sound;
 import org.bukkit.World;
 import org.bukkit.block.Block;
+import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Villager;
+import org.bukkit.entity.memory.MemoryKey;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
+import org.bukkit.event.entity.VillagerCareerChangeEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.world.EntitiesLoadEvent;
+import org.bukkit.event.world.EntitiesUnloadEvent;
+import org.bukkit.plugin.Plugin;
+import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
@@ -38,8 +45,12 @@ import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.UUID;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
@@ -72,6 +83,18 @@ import java.util.zip.GZIPOutputStream;
  *   - a la pose, un id manquant est reconstitue ; si les donnees sont vides
  *     (anciens oeufs casses), un villageois du meme metier/niveau/nom est recree
  *     (ses anciens echanges sont alors perdus).
+ *
+ * GARDE-METIER (villageois qui perdent leurs echanges au redemarrage) :
+ *   un villageois avec qui personne n'a encore echange (XP 0) perd son metier, donc
+ *   ses echanges, des que son poste de travail "disparait" de sa memoire. Au
+ *   redemarrage, Paper peut verifier ce poste avant que ses donnees soient chargees :
+ *   le villageois croit son poste detruit et ses echanges sont re-tires.
+ *   Desormais la position du poste est memorisee dans le villageois (PDC
+ *   villagercapture:jobsite) au chargement, toutes les 10 s et au dechargement.
+ *   Si le villageois va perdre son metier alors que ce poste est TOUJOURS en place
+ *   (ou dans un chunk pas encore charge), la perte est annulee et le poste lui est
+ *   rendu. Casser le poste reste le moyen normal de changer ses echanges.
+ *   /villagers (OP/console) : statistiques ; /villagers snapshot : memorisation forcee.
  */
 public class VillagerCapture extends LoadedPlugin implements Listener {
 
@@ -80,9 +103,16 @@ public class VillagerCapture extends LoadedPlugin implements Listener {
     private NamespacedKey keyData;
     private NamespacedKey keyMarker;
     private NamespacedKey keyProf, keyLevel, keyType, keyName;
+    private NamespacedKey keyJob;
+
+    private BukkitTask snapTask;
+    private final Map<UUID, Long> lastKeepLog = new HashMap<>();
+    private long keptCount = 0, allowedCount = 0;
+    private String lastKept = "-";
 
     @Override
     public void onEnable() {
+        keyJob = new NamespacedKey("villagercapture", "jobsite");
         keyData = new NamespacedKey("villagercapture", "entity");
         keyMarker = new NamespacedKey("villagercapture", "captured");
         keyProf = new NamespacedKey("villagercapture", "profession");
@@ -97,18 +127,221 @@ public class VillagerCapture extends LoadedPlugin implements Listener {
             }
         } catch (Throwable ignored) {}
 
+        // Une ancienne instance (rechargement) encore inscrite traiterait les events en double.
+        try {
+            String myClass = getClass().getName();
+            for (HandlerList hl : HandlerList.getHandlerLists()) {
+                for (org.bukkit.plugin.RegisteredListener rl : hl.getRegisteredListeners()) {
+                    Object l = rl.getListener();
+                    if (l != null && l != this && l.getClass().getName().equals(myClass)) {
+                        try { hl.unregister(rl); } catch (Throwable ignored) {}
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+
         try {
             Bukkit.getPluginManager().registerEvents(this, getHost());
             getLogger().info("[VillagerCapture] actif - sneak + clic droit main vide sur un villageois.");
         } catch (Throwable t) {
             getLogger().severe("[VillagerCapture] impossible d'enregistrer le listener : " + t);
         }
+
+        // Garde-metier : memorisation immediate puis toutes les 10 s.
+        try {
+            int n = snapshotAll();
+            getLogger().info("[VillagerCapture] garde-metier actif : poste de travail memorise pour " + n + " villageois charges.");
+            snapTask = Bukkit.getScheduler().runTaskTimer((Plugin) getHost(), () -> snapshotAll(), 200L, 200L);
+        } catch (Throwable t) {
+            getLogger().warning("[VillagerCapture] garde-metier : tache de memorisation impossible : " + t);
+        }
+        try { registerCommand("villagers", this::onVillagersCommand); } catch (Throwable t) {
+            getLogger().warning("[VillagerCapture] commande /villagers impossible : " + t);
+        }
     }
 
     @Override
     public void onDisable() {
+        try { snapshotAll(); } catch (Throwable ignored) {}
+        try { if (snapTask != null) snapTask.cancel(); } catch (Throwable ignored) {}
         try { HandlerList.unregisterAll(this); } catch (Throwable ignored) {}
         getLogger().info("[VillagerCapture] desactive.");
+    }
+
+    // ===================== GARDE-METIER =====================
+
+    /** Memorise le poste de travail de tous les villageois charges. */
+    private int snapshotAll() {
+        int n = 0;
+        for (World w : Bukkit.getWorlds()) {
+            for (Villager v : w.getEntitiesByClass(Villager.class)) {
+                if (snapshot(v)) n++;
+            }
+        }
+        return n;
+    }
+
+    /** Copie la memoire JOB_SITE du villageois dans son PDC (sauvegarde avec l'entite). */
+    private boolean snapshot(Villager v) {
+        try {
+            Location js = v.getMemory(MemoryKey.JOB_SITE);
+            if (js == null || js.getWorld() == null) return false;
+            String s = js.getWorld().getName() + ";" + js.getBlockX() + ";" + js.getBlockY() + ";" + js.getBlockZ();
+            PersistentDataContainer pdc = v.getPersistentDataContainer();
+            if (!s.equals(pdc.get(keyJob, PersistentDataType.STRING))) pdc.set(keyJob, PersistentDataType.STRING, s);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onEntitiesLoad(EntitiesLoadEvent e) {
+        // Au chargement la memoire vient tout juste d'etre relue depuis le disque :
+        // c'est le bon moment pour noter le poste, avant toute verification.
+        for (Entity ent : e.getEntities()) if (ent instanceof Villager v) snapshot(v);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onEntitiesUnload(EntitiesUnloadEvent e) {
+        for (Entity ent : e.getEntities()) if (ent instanceof Villager v) snapshot(v);
+    }
+
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onCareerChange(VillagerCareerChangeEvent e) {
+        if (!"LOSING_JOB".equals(String.valueOf(e.getReason()))) return;
+        Villager v = e.getEntity();
+        String why;
+        try { why = keepReason(v); } catch (Throwable t) { why = null; }
+        if (why == null) { allowedCount++; return; }
+        e.setCancelled(true);
+        keptCount++;
+        Location l = v.getLocation();
+        lastKept = profKey(v) + " " + l.getBlockX() + " " + l.getBlockY() + " " + l.getBlockZ();
+        long now = System.currentTimeMillis();
+        Long last = lastKeepLog.get(v.getUniqueId());
+        if (last == null || now - last > 600_000L) {
+            if (lastKeepLog.size() > 5000) lastKeepLog.clear();
+            lastKeepLog.put(v.getUniqueId(), now);
+            getLogger().info("[VillagerCapture] garde-metier : " + profKey(v) + " en " + l.getWorld().getName() + " "
+                    + l.getBlockX() + " " + l.getBlockY() + " " + l.getBlockZ() + " garde ses echanges (" + why + ").");
+        }
+    }
+
+    /**
+     * Raison de garder le metier, ou null pour laisser faire vanilla
+     * (poste reellement casse -> le joueur peut changer les echanges).
+     */
+    private String keepReason(Villager v) {
+        String prof = profKey(v);
+        if (prof == null || prof.equals("none") || prof.equals("nitwit")) return null;
+        Location vl = v.getLocation();
+        String s = v.getPersistentDataContainer().get(keyJob, PersistentDataType.STRING);
+        if (s != null) {
+            String[] p = s.split(";");
+            if (p.length != 4) return null;
+            World w = Bukkit.getWorld(p[0]);
+            if (w == null) return null;
+            int x, y, z;
+            try { x = Integer.parseInt(p[1]); y = Integer.parseInt(p[2]); z = Integer.parseInt(p[3]); } catch (NumberFormatException ex) { return null; }
+            if (!w.isChunkLoaded(x >> 4, z >> 4)) {
+                restoreJobSite(v, w, x, y, z);
+                return "poste dans un chunk pas encore charge";
+            }
+            if (prof.equals(workstationProfession(w.getBlockAt(x, y, z).getType()))) {
+                restoreJobSite(v, w, x, y, z);
+                return "poste toujours en place";
+            }
+            return null;
+        }
+        // Rien de memorise (villageois jamais vu par le plugin) : poste du bon metier colle au villageois ?
+        World w = vl.getWorld();
+        if (w == null) return null;
+        int bx = vl.getBlockX(), by = vl.getBlockY(), bz = vl.getBlockZ();
+        for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) for (int dz = -1; dz <= 1; dz++) {
+            int x = bx + dx, y = by + dy, z = bz + dz;
+            if (!w.isChunkLoaded(x >> 4, z >> 4)) continue;
+            if (prof.equals(workstationProfession(w.getBlockAt(x, y, z).getType()))) {
+                restoreJobSite(v, w, x, y, z);
+                return "poste a cote du villageois";
+            }
+        }
+        return null;
+    }
+
+    /** Rend la memoire du poste (seulement si le villageois est assez pres pour le valider, 16 blocs). */
+    private void restoreJobSite(Villager v, World w, int x, int y, int z) {
+        try {
+            Location vl = v.getLocation();
+            if (vl.getWorld() == null || !vl.getWorld().equals(w)) return;
+            double dx = x + 0.5 - vl.getX(), dy = y + 0.5 - vl.getY(), dz = z + 0.5 - vl.getZ();
+            if (dx * dx + dy * dy + dz * dz > 16 * 16) return;
+            v.setMemory(MemoryKey.JOB_SITE, new Location(w, x, y, z));
+        } catch (Throwable ignored) {}
+    }
+
+    private static String profKey(Villager v) {
+        try {
+            Object p = v.getProfession();
+            if (p instanceof org.bukkit.Keyed k) return k.getKey().getKey().toLowerCase(Locale.ROOT);
+            String raw = String.valueOf(p);
+            int i = raw.lastIndexOf(':');
+            return (i >= 0 ? raw.substring(i + 1) : raw).toLowerCase(Locale.ROOT);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** Metier associe a un bloc de poste de travail (null si ce n'en est pas un). */
+    private static String workstationProfession(Material m) {
+        switch (m.name()) {
+            case "LECTERN": return "librarian";
+            case "COMPOSTER": return "farmer";
+            case "BLAST_FURNACE": return "armorer";
+            case "SMOKER": return "butcher";
+            case "CARTOGRAPHY_TABLE": return "cartographer";
+            case "BREWING_STAND": return "cleric";
+            case "BARREL": return "fisherman";
+            case "FLETCHING_TABLE": return "fletcher";
+            case "CAULDRON": case "WATER_CAULDRON": case "LAVA_CAULDRON": case "POWDER_SNOW_CAULDRON": return "leatherworker";
+            case "STONECUTTER": return "mason";
+            case "LOOM": return "shepherd";
+            case "SMITHING_TABLE": return "toolsmith";
+            case "GRINDSTONE": return "weaponsmith";
+            default: return null;
+        }
+    }
+
+    private boolean onVillagersCommand(CommandSender sender, org.bukkit.command.Command cmd, String label, String[] args) {
+        if (!(sender.isOp() || !(sender instanceof Player))) {
+            sender.sendMessage(PREFIX.append(Component.text("Commande reservee aux OP.", NamedTextColor.RED)));
+            return true;
+        }
+        if (args.length > 0 && args[0].equalsIgnoreCase("snapshot")) {
+            int n = snapshotAll();
+            sender.sendMessage(PREFIX.append(Component.text("Poste memorise pour " + n + " villageois.", NamedTextColor.GREEN)));
+            return true;
+        }
+        int total = 0, withJob = 0, stored = 0, jobless = 0, traded = 0;
+        Map<String, Integer> byProf = new TreeMap<>();
+        for (World w : Bukkit.getWorlds()) {
+            for (Villager v : w.getEntitiesByClass(Villager.class)) {
+                total++;
+                String p = profKey(v);
+                byProf.merge(String.valueOf(p), 1, Integer::sum);
+                try { if (v.getMemory(MemoryKey.JOB_SITE) != null) withJob++; } catch (Throwable ignored) {}
+                if (v.getPersistentDataContainer().has(keyJob, PersistentDataType.STRING)) stored++;
+                if ("none".equals(p)) jobless++;
+                try { if (v.getVillagerExperience() > 0) traded++; } catch (Throwable ignored) {}
+            }
+        }
+        sender.sendMessage(PREFIX.append(Component.text("Villageois charges : " + total + " (sans metier : " + jobless
+                + ", deja echange : " + traded + ")", NamedTextColor.WHITE)));
+        sender.sendMessage(PREFIX.append(Component.text("Avec poste en memoire : " + withJob + " | poste memorise par le plugin : " + stored, NamedTextColor.GRAY)));
+        sender.sendMessage(PREFIX.append(Component.text("Pertes de metier bloquees : " + keptCount + " (derniere : " + lastKept
+                + ") | laissees (poste casse) : " + allowedCount, NamedTextColor.GRAY)));
+        sender.sendMessage(PREFIX.append(Component.text("Metiers : " + byProf, NamedTextColor.DARK_GRAY)));
+        return true;
     }
 
     // ===================== CAPTURE =====================
