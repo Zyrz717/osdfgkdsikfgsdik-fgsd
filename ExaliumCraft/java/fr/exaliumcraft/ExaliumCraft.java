@@ -70,6 +70,48 @@ public class ExaliumCraft extends LoadedPlugin implements org.bukkit.event.Liste
                 + " type=" + e.getInventory().getType());
     }
 
+    // Suivi des clics sur la case resultat (qui annule ?)
+    private final java.util.Map<org.bukkit.event.inventory.InventoryClickEvent, StringBuilder> clickTrace = new java.util.WeakHashMap<>();
+
+    private boolean exaliumResultClick(org.bukkit.event.inventory.InventoryClickEvent e) {
+        if (e.getSlotType() != org.bukkit.event.inventory.InventoryType.SlotType.RESULT) return false;
+        org.bukkit.event.inventory.InventoryType t = e.getView().getTopInventory().getType();
+        if (t != org.bukkit.event.inventory.InventoryType.WORKBENCH && t != org.bukkit.event.inventory.InventoryType.CRAFTING) return false;
+        String id = iaId(e.getCurrentItem());
+        return id != null && id.startsWith("exalium:");
+    }
+
+    private void trace(org.bukkit.event.inventory.InventoryClickEvent e, String prio) {
+        if (!exaliumResultClick(e)) return;
+        clickTrace.computeIfAbsent(e, k -> new StringBuilder()).append(prio).append(e.isCancelled() ? "=ANNULE " : "=ok ");
+    }
+
+    @org.bukkit.event.EventHandler(priority = org.bukkit.event.EventPriority.LOWEST)
+    public void c1(org.bukkit.event.inventory.InventoryClickEvent e) { trace(e, "LOWEST"); }
+    @org.bukkit.event.EventHandler(priority = org.bukkit.event.EventPriority.LOW)
+    public void c2(org.bukkit.event.inventory.InventoryClickEvent e) { trace(e, "LOW"); }
+    @org.bukkit.event.EventHandler(priority = org.bukkit.event.EventPriority.NORMAL)
+    public void c3(org.bukkit.event.inventory.InventoryClickEvent e) { trace(e, "NORMAL"); }
+    @org.bukkit.event.EventHandler(priority = org.bukkit.event.EventPriority.HIGH)
+    public void c4(org.bukkit.event.inventory.InventoryClickEvent e) { trace(e, "HIGH"); }
+    @org.bukkit.event.EventHandler(priority = org.bukkit.event.EventPriority.HIGHEST)
+    public void c5(org.bukkit.event.inventory.InventoryClickEvent e) { trace(e, "HIGHEST"); }
+    @org.bukkit.event.EventHandler(priority = org.bukkit.event.EventPriority.MONITOR)
+    public void c6(org.bukkit.event.inventory.InventoryClickEvent e) {
+        if (!exaliumResultClick(e)) return;
+        trace(e, "MONITOR");
+        StringBuilder sb = clickTrace.remove(e);
+        final org.bukkit.entity.HumanEntity who = e.getWhoClicked();
+        getLogger().info("[ExaliumCraft] CLIC " + who.getName() + " " + e.getClass().getSimpleName() + " objet=" + desc(e.getCurrentItem())
+                + " curseur=" + desc(e.getCursor()) + " clic=" + e.getClick() + " action=" + e.getAction() + " etats: " + sb);
+        Bukkit.getScheduler().runTask((org.bukkit.plugin.Plugin) getHost(), () -> {
+            try {
+                getLogger().info("[ExaliumCraft] APRES " + who.getName() + " curseur=" + desc(who.getItemOnCursor())
+                        + " resultat=" + desc(e.getView().getTopInventory().getItem(0)));
+            } catch (Throwable ignored) {}
+        });
+    }
+
     @org.bukkit.event.EventHandler(priority = org.bukkit.event.EventPriority.MONITOR)
     public void onCraft(CraftItemEvent e) {
         String rid = iaId(e.getCurrentItem());
