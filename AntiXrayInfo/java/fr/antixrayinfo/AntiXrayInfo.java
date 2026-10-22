@@ -81,7 +81,7 @@ public class AntiXrayInfo extends LoadedPlugin {
             if (og instanceof boolean[] arr) for (boolean b : arr) if (b) hidden++;
             Object preset = get(ctl, "presetBlockStatesFull");
             int presetN = preset instanceof Object[] pa ? pa.length : -1;
-            return w.getName() + " : anti-xray ACTIF, mode " + get(ctl, "engineMode") + ", hauteur max " + get(ctl, "maxBlockHeight")
+            return w.getName() + " : anti-xray ACTIF (" + ctl.getClass().getName() + "), mode " + get(ctl, "engineMode") + ", hauteur max " + get(ctl, "maxBlockHeight")
                     + ", rayon " + get(ctl, "updateRadius") + ", etats caches " + hidden + ", faux blocs " + presetN
                     + ", permission " + get(ctl, "usePermission");
         } catch (Throwable t) {
@@ -99,12 +99,13 @@ public class AntiXrayInfo extends LoadedPlugin {
         Object ax = findField(anticheat.getClass(), "antiXray").get(anticheat);
         boolean enabled = (boolean) findField(ax.getClass(), "enabled").get(ax);
         ClassLoader cl = old.getClass().getClassLoader();
-        Class<?> iface = Class.forName("io.papermc.paper.antixray.ChunkPacketBlockController", true, cl);
+        String pkg = old.getClass().getPackageName();
+        Class<?> iface = Class.forName(pkg + ".ChunkPacketBlockController", true, cl);
         Object neu;
         if (!enabled) {
             neu = findField(iface, "NO_OPERATION_INSTANCE").get(null);
         } else {
-            Class<?> axc = Class.forName("io.papermc.paper.antixray.ChunkPacketBlockControllerAntiXray", true, cl);
+            Class<?> axc = Class.forName(pkg + ".ChunkPacketBlockControllerAntiXray", true, cl);
             Executor ex = null;
             if (axc.isInstance(old)) { Object e = get(old, "executor"); if (e instanceof Executor ee) ex = ee; }
             if (ex == null) {
