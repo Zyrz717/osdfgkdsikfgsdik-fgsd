@@ -51,7 +51,7 @@ import java.util.regex.Pattern;
  *   -> RESERVE a l'UUID de zyrx717 (voir ALLOWED). Permissions et OP ignores :
  *      tout le monde (et la console) recoit "Demande à zyrx717".
  *   -> sans duree (ou "perm") : pioche PERMANENTE ; avec duree (24h, 1d, 10d, 1d12h) : temporaire.
- *   -> pioche Netherite qui casse en 6x6 dans le plan de la face minee
+ *   -> pioche Netherite qui casse en 6x6 sur 2 couches de profondeur (72 blocs)
  *      (chaque bloc est casse "comme par le joueur" : protections, sac de minage, Fortune... respectes),
  *      son d'amethyste, incassable, Efficacite V,
  *      CONSERVEE a la mort (rendue au respawn, sauvegardee dans pickaxe6x6-keep.yml).
@@ -162,7 +162,7 @@ public class Pickaxe6x6 extends LoadedPlugin implements Listener {
             meta.displayName(gradientName("Optaland Pickaxe 6x6"));
 
             List<Component> lore = new ArrayList<>();
-            lore.add(line("Casse en 6x6", NamedTextColor.YELLOW));
+            lore.add(line("Casse en 6x6 sur 2 couches", NamedTextColor.YELLOW));
             if (expire > 0) {
                 lore.add(line("Duree : " + formatDuration(durationMs), NamedTextColor.GRAY));
                 lore.add(line("Expire le " + FMT.format(new Date(expire)), NamedTextColor.RED));
@@ -230,18 +230,23 @@ public class Pickaxe6x6 extends LoadedPlugin implements Listener {
     }
 
     /**
-     * Renvoie les 36 blocs du plan 6x6 selon la face regardee.
+     * Renvoie les 72 blocs de la zone 6x6 sur 2 couches de profondeur selon la face regardee.
      * 6 est pair : la zone va de -2 a +3 autour du bloc mine (vers le haut / la droite).
+     * Couche 1 = celle du bloc mine, couche 2 = juste derriere (dans le sens du minage).
      */
     private List<Block> area6x6(Block center, BlockFace face) {
-        List<Block> out = new ArrayList<>(36);
+        List<Block> out = new ArrayList<>(72);
         boolean vertical = (face == BlockFace.UP || face == BlockFace.DOWN);
         boolean zAxis = (face == BlockFace.NORTH || face == BlockFace.SOUTH);
-        for (int a = -2; a <= 3; a++) {
-            for (int b = -2; b <= 3; b++) {
-                if (vertical)      out.add(center.getRelative(a, 0, b));   // plan horizontal
-                else if (zAxis)    out.add(center.getRelative(a, b, 0));   // plan X/Y
-                else               out.add(center.getRelative(0, b, a));   // plan Z/Y (EST/OUEST)
+        BlockFace profondeur = face.getOppositeFace(); // on creuse vers l'interieur
+        for (int couche = 0; couche < 2; couche++) {
+            Block base = center.getRelative(profondeur, couche);
+            for (int a = -2; a <= 3; a++) {
+                for (int b = -2; b <= 3; b++) {
+                    if (vertical)      out.add(base.getRelative(a, 0, b));   // plan horizontal
+                    else if (zAxis)    out.add(base.getRelative(a, b, 0));   // plan X/Y
+                    else               out.add(base.getRelative(0, b, a));   // plan Z/Y (EST/OUEST)
+                }
             }
         }
         return out;
