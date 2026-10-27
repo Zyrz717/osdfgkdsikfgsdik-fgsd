@@ -222,8 +222,6 @@ public class RandomTeleport extends LoadedPlugin {
 
         inv.setItem(SLOT_OVERWORLD, icon(player, Material.GRASS_BLOCK, "ᴏᴠᴇʀᴡᴏʀʟᴅ", NamedTextColor.GREEN,
                 World.Environment.NORMAL, vip));
-        inv.setItem(SLOT_NETHER, icon(player, Material.NETHERRACK, "ɴᴇᴛʜᴇʀ", NamedTextColor.RED,
-                World.Environment.NETHER, vip));
         inv.setItem(SLOT_END, icon(player, Material.END_STONE, "ᴇɴᴅ", NamedTextColor.LIGHT_PURPLE,
                 World.Environment.THE_END, vip));
 
@@ -335,6 +333,10 @@ public class RandomTeleport extends LoadedPlugin {
     // --------------------------------------------------------------- lancement
 
     private void launch(Player player, World.Environment env) {
+        if (env == World.Environment.NETHER) {
+            player.sendMessage(msg("Le RTP dans le nether est désactivé.", NamedTextColor.RED));
+            return;
+        }
         if (!player.hasPermission("rtp.use")) {
             player.sendMessage(msg("Vous n'avez pas la permission d'utiliser le RTP.", NamedTextColor.RED));
             return;
